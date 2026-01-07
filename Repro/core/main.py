@@ -1,13 +1,13 @@
 from torch.utils.data import DataLoader
 from oppor_dataloader import build_opportunity_loader
 from model_GLIE import kl_divergence, GILE
-
+from utils import GradReverse
 import torch
 import torch.nn.functional as F
 
 
 # hyperparameter
-beta_kl = 0.01      # KL-Regularisierung
+beta_kl = 0.2      # KL-Regularisierung
 alpha_cls = 1.0    # Klassifikations-Loss
 gamma_ie = 0.5     # Independent Excitation
 
@@ -52,21 +52,21 @@ def train_one_epoch(model, loader):
         y = y.to(device)
         d = d.to(device)
 
-        out = model(x)
+        out = model(x, y, d)
 
         # reconstruction (ELBO)
         recon_loss = F.mse_loss(out["x_recon"], x)
-
-        # priors p(z)=N(0,I)
-
-        mu0_a = torch.zeros_like(out["mu_a"])
-        lv0_a = torch.zeros_like(out["logvar_a"])
-        mu0_d = torch.zeros_like(out["mu_d"])
-        lv0_d = torch.zeros_like(out["logvar_d"])
+        mu_a_p, sigma_a_p = model.activity_prior(y)
+        mu_d_p, sigma_d_p = model.domain_prior(d)
+        #print(mu_d_p.mean(), mu_a_p.mean())
+        logvar_a_p = torch.log(sigma_a_p ** 2)
+        logvar_d_p = torch.log(sigma_d_p ** 2)
 
         # KL(q || p)
-        kl_a = kl_divergence(out["logvar_a"], lv0_a, out["mu_a"], mu0_a)
-        kl_d = kl_divergence(out["logvar_d"], lv0_d, out["mu_d"], mu0_d)
+        kl_a = kl_divergence(out["logvar_a"], logvar_a_p, out["mu_a"], mu_a_p)
+
+        kl_d = kl_divergence(out["logvar_d"], logvar_d_p, out["mu_d"], mu_d_p)
+
 
         # negative ELBO (to minimize)
         elbo_loss = recon_loss + beta_kl * (kl_a + kl_d)
@@ -77,21 +77,19 @@ def train_one_epoch(model, loader):
 
         classification_loss = activity_loss + domain_loss
 
+        z_a_rev = GradReverse.apply(out["z_activity"], gamma_ie)
+        z_d_rev = GradReverse.apply(out["z_domain"], gamma_ie)
+        
         # independent excitation
-        domain_from_activity = model.domain_classifier(out["z_activity"])
-        activity_from_domain = model.activity_classifier(out["z_domain"])
+        domain_from_activity = model.domain_classifier(z_a_rev)
+        activity_from_domain = model.activity_classifier(z_d_rev)
 
         ie_loss = (
             F.cross_entropy(domain_from_activity, d)
             + F.cross_entropy(activity_from_domain, y)
         )
 
-        # total loss
-        loss = (
-            elbo_loss
-            + alpha_cls * classification_loss
-            - gamma_ie * ie_loss
-        )
+        loss = elbo_loss + alpha_cls * classification_loss + ie_loss
 
         optimizer.zero_grad()
         loss.backward()
@@ -103,6 +101,6 @@ def train_one_epoch(model, loader):
 
 
 # training
-for epoch in range(20):
+for epoch in range(100):
     loss = train_one_epoch(model, train_loader)
     print(f"Epoch {epoch:02d} | Train Loss: {loss:.4f}")

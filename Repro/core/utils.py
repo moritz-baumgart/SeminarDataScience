@@ -1,5 +1,6 @@
 import numpy as np
 from sliding_window import sliding_window
+import torch
 def opp_sliding_window_w_d(
     data_x: np.ndarray,
     data_y: np.ndarray,
@@ -55,3 +56,13 @@ def opp_sliding_window_w_d(
         y_win,
         d_win,
     )
+
+class GradReverse(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, x, lambd):
+        ctx.lambd = lambd
+        return x.view_as(x)
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        return -ctx.lambd * grad_output, None
