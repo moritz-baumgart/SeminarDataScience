@@ -5,17 +5,13 @@ import torch
 from torch.utils.data import Dataset, DataLoader
 from pandas import Series
 from utils import opp_sliding_window_w_d
-# --------------------------------------------------
 # Configuration
-# --------------------------------------------------
 
 NUM_FEATURES = 77
 DATA_ROOT = "./data/OpportunityUCIDataset/dataset/"
 WINDOW_SIZE = 24
-STEP_SIZE = 12
-# --------------------------------------------------
+STEP_SIZE = 24
 # Dataset
-# --------------------------------------------------
 
 class OpportunityDataset(Dataset):
     """
@@ -55,9 +51,7 @@ class OpportunityDataset(Dataset):
             np.concatenate(ds),
         )
 
-# --------------------------------------------------
 # Domain loading
-# --------------------------------------------------
 
 def load_domain(domain_id, label_type):
     files = [
@@ -85,9 +79,7 @@ def load_domain(domain_id, label_type):
     d = d.reshape(-1)
     return x, y, d
 
-# --------------------------------------------------
 # Preprocessing pipeline
-# --------------------------------------------------
 
 def process_dataset_file(data, label):
     data = select_columns_opp(data)
@@ -152,9 +144,7 @@ def normalize(x):
     x = (x - mean) / std
     return x
 
-# --------------------------------------------------
 # Convenience loader builders
-# --------------------------------------------------
 
 def build_opportunity_loader(
     domain_ids,
@@ -165,22 +155,20 @@ def build_opportunity_loader(
     dataset = OpportunityDataset(domain_ids, label_type)
     return DataLoader(dataset, batch_size=batch_size, shuffle=shuffle)
 
-# --------------------------------------------------
 # Example usage (LOSO)
-# --------------------------------------------------
 
-if __name__ == "__main__":
-    train_loader = build_opportunity_loader(
-        domain_ids=["S1", "S2", "S3"],
-        batch_size=64,
-        shuffle=True,
-    )
+#if __name__ == "__main__":
+#    train_loader = build_opportunity_loader(
+#        domain_ids=["S1", "S2", "S3"],
+#        batch_size=64,
+#        shuffle=True,
+#    )#
 
-    test_loader = build_opportunity_loader(
-        domain_ids=["S4"],
-        batch_size=64,
-        shuffle=False,
-    )
+#    test_loader = build_opportunity_loader(
+#        domain_ids=["S4"],
+#        batch_size=64,
+#        shuffle=False,
+#    )
 
-    x, y, d = next(iter(train_loader))
-    print(x.shape, y.shape, d.shape)
+#    x, y, d = next(iter(train_loader))
+#    print(x.shape, y.shape, d.shape)

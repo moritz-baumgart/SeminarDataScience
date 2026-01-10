@@ -2,12 +2,7 @@ from __future__ import annotations
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-
-
-
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
+import torch.distributions as dist
 from typing import Tuple
 
 
@@ -319,39 +314,40 @@ class GILE(nn.Module):
             "d": d,
         }
     
-    def compute_loss(self, outputs, x, y, d):
-        # Reconstruction
-        recon_loss = F.mse_loss(outputs["x_recon"], x)
+  
+    def compute_loss(self, x, y, d, pred, beta_kl, aux_y=1.0, aux_d=1.0):
+        recon_loss = F.mse_loss(pred["x_recon"], x, reduction="mean")
 
-        # ----- PRIORS GO HERE -----
-        mu_a_p, sigma_a_p = self.activity_prior(y)
-        mu_d_p, sigma_d_p = self.domain_prior(d)
+        #  priors p(z|y), p(z_d|d) 
+        mu_a_p, sigma_a_p = self.activity_prior(y)   # (B, latent)
+        mu_d_p, sigma_d_p = self.domain_prior(d)     # (B, latent
 
-        logvar_a_p = torch.log(sigma_a_p ** 2)
-        logvar_d_p = torch.log(sigma_d_p ** 2)
+        #  posteriors q(z|x), q(z_d|x) 
+        std_a_q = torch.exp(0.5 * pred["logvar_a"])
+        std_d_q = torch.exp(0.5 * pred["logvar_d"])
+        
+        # encoder predicted latent Dist
+        q_a = dist.Independent(dist.Normal(pred["mu_a"], std_a_q), 1)
+        q_d = dist.Independent(dist.Normal(pred["mu_d"], std_d_q), 1)
 
-        kl_activity = kl_divergence(
-            outputs["logvar_a"], logvar_a_p,
-            outputs["mu_a"], mu_a_p,
-        )
+        # model expected latnet Dist
+        p_a = dist.Independent(dist.Normal(mu_a_p, sigma_a_p), 1)
+        p_d = dist.Independent(dist.Normal(mu_d_p, sigma_d_p), 1)
 
-        kl_domain = kl_divergence(
-            outputs["logvar_d"], logvar_d_p,
-            outputs["mu_d"], mu_d_p,
-        )
+       # E_q[log p - log q] = -KL(q||p)
+        kl_a_neg = (p_a.log_prob(pred["z_activity"]) - q_a.log_prob(pred["z_activity"]))  # (B,)
+        kl_d_neg = (p_d.log_prob(pred["z_domain"])   - q_d.log_prob(pred["z_domain"]))    # (B,)
 
-        # Auxiliary classification
-        cls_activity = F.cross_entropy(outputs["activity_logits"], y)
-        cls_domain = F.cross_entropy(outputs["domain_logits"], d)
+        kl_a_neg = kl_a_neg.mean()
+        kl_d_neg = kl_d_neg.mean()
 
-        total_loss = (
-            recon_loss
-            + self.beta_activity * kl_activity
-            + self.beta_domain * kl_domain
-            + cls_activity
-            + cls_domain
-        )
+        # ---------- Auxiliary classifiers ----------
+        ce_y = F.cross_entropy(pred["activity_logits"], y, reduction="mean")
+        ce_d = F.cross_entropy(pred["domain_logits"],   d, reduction="mean")
 
+        # negative ELBO (to minimize): recon_loss - (logp-logq) = recon_loss + KL
+        elbo_loss = recon_loss - beta_kl * (kl_a_neg + kl_d_neg)
+        total_loss = elbo_loss + aux_y * ce_y + aux_d * ce_d
         return total_loss
 
 def kl_divergence(logvar_q, logvar_p, mu_q, mu_p):

@@ -4,10 +4,11 @@ from model_GLIE import kl_divergence, GILE
 from utils import GradReverse
 import torch
 import torch.nn.functional as F
+from sklearn.metrics import f1_score
 
 
 # hyperparameter
-beta_kl = 0.2      # KL-Regularisierung
+beta_kl = 0.8     # KL-Regularisierung
 alpha_cls = 1.0    # Klassifikations-Loss
 gamma_ie = 0.5     # Independent Excitation
 
@@ -54,42 +55,7 @@ def train_one_epoch(model, loader):
 
         out = model(x, y, d)
 
-        # reconstruction (ELBO)
-        recon_loss = F.mse_loss(out["x_recon"], x)
-        mu_a_p, sigma_a_p = model.activity_prior(y)
-        mu_d_p, sigma_d_p = model.domain_prior(d)
-        #print(mu_d_p.mean(), mu_a_p.mean())
-        logvar_a_p = torch.log(sigma_a_p ** 2)
-        logvar_d_p = torch.log(sigma_d_p ** 2)
-
-        # KL(q || p)
-        kl_a = kl_divergence(out["logvar_a"], logvar_a_p, out["mu_a"], mu_a_p)
-
-        kl_d = kl_divergence(out["logvar_d"], logvar_d_p, out["mu_d"], mu_d_p)
-
-
-        # negative ELBO (to minimize)
-        elbo_loss = recon_loss + beta_kl * (kl_a + kl_d)
-
-        # classification
-        activity_loss = F.cross_entropy(out["activity_logits"], y)
-        domain_loss   = F.cross_entropy(out["domain_logits"], d)
-
-        classification_loss = activity_loss + domain_loss
-
-        z_a_rev = GradReverse.apply(out["z_activity"], gamma_ie)
-        z_d_rev = GradReverse.apply(out["z_domain"], gamma_ie)
-        
-        # independent excitation
-        domain_from_activity = model.domain_classifier(z_a_rev)
-        activity_from_domain = model.activity_classifier(z_d_rev)
-
-        ie_loss = (
-            F.cross_entropy(domain_from_activity, d)
-            + F.cross_entropy(activity_from_domain, y)
-        )
-
-        loss = elbo_loss + alpha_cls * classification_loss + ie_loss
+        loss = model.compute_loss(x,y,d,out,beta_kl)
 
         optimizer.zero_grad()
         loss.backward()
@@ -99,8 +65,104 @@ def train_one_epoch(model, loader):
 
     return total_loss / len(loader)
 
+@torch.no_grad()
+def evaluate(model, loader):
+    model.eval()
+
+    all_y_true = []
+    all_y_pred = []
+
+    all_d_true = []
+    all_d_pred = []
+
+    for x, y, d in loader:
+        x = x.to(device)
+        y = y.to(device)
+        d = d.to(device)
+
+        out = model(x, y, d)
+
+        # Activity predictions
+        y_pred = torch.argmax(out["activity_logits"], dim=1)
+
+        all_y_true.append(y.cpu())
+        all_y_pred.append(y_pred.cpu())
+
+        # (optional) Domain predictions
+        d_pred = torch.argmax(out["domain_logits"], dim=1)
+        all_d_true.append(d.cpu())
+        all_d_pred.append(d_pred.cpu())
+
+    y_true = torch.cat(all_y_true).numpy()
+    y_pred = torch.cat(all_y_pred).numpy()
+
+    d_true = torch.cat(all_d_true).numpy()
+    d_pred = torch.cat(all_d_pred).numpy()
+
+    activity_f1_macro = f1_score(y_true, y_pred, average="macro")
+    activity_f1_weighted = f1_score(y_true, y_pred, average="weighted")
+
+    domain_f1_macro = f1_score(d_true, d_pred, average="macro")
+
+    return {
+        "activity_f1_macro": activity_f1_macro,
+        "activity_f1_weighted": activity_f1_weighted,
+        "domain_f1_macro": domain_f1_macro,
+    }
+@torch.no_grad()
+def eval(model, loader):
+    model.eval()
+
+    all_y_true = []
+    all_y_pred = []
+
+    all_d_true = []
+    all_d_pred = []
+
+    for x, y, d in loader:
+        x = x.to(device)
+        y = y.to(device)
+        d = d.to(device)
+
+        out = model(x, y, d)
+
+        # Activity predictions
+        y_pred = torch.argmax(out["activity_logits"], dim=1)
+
+        all_y_true.append(y.cpu())
+        all_y_pred.append(y_pred.cpu())
+
+        # (optional) Domain predictions
+        d_pred = torch.argmax(out["domain_logits"], dim=1)
+        all_d_true.append(d.cpu())
+        all_d_pred.append(d_pred.cpu())
+
+    y_true = torch.cat(all_y_true).numpy()
+    y_pred = torch.cat(all_y_pred).numpy()
+
+    d_true = torch.cat(all_d_true).numpy()
+    d_pred = torch.cat(all_d_pred).numpy()
+
+    activity_f1_macro = f1_score(y_true, y_pred, average="macro")
+    activity_f1_weighted = f1_score(y_true, y_pred, average="weighted")
+
+    domain_f1_macro = f1_score(d_true, d_pred, average="macro")
+
+    return {
+        "activity_f1_macro": activity_f1_macro,
+        "activity_f1_weighted": activity_f1_weighted,
+        "domain_f1_macro": domain_f1_macro,
+    }
+
 
 # training
-for epoch in range(100):
+for epoch in range(500):
     loss = train_one_epoch(model, train_loader)
-    print(f"Epoch {epoch:02d} | Train Loss: {loss:.4f}")
+    metrics = evaluate(model, test_loader)
+    print(
+        f"Epoch {epoch:02d} | "
+        f"Train Loss: {loss:.4f} | "
+        f"Act F1 (macro): {metrics['activity_f1_macro']:.3f} | "
+        f"Act F1 (weighted): {metrics['activity_f1_weighted']:.3f} | "
+        f"Domain F1 (weighted): {metrics['domain_f1_macro']:.3f}"
+    )
