@@ -4,7 +4,8 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torch.distributions as dist
 from typing import Tuple
-
+from utils import GradReverse
+from typing import Tuple, List, Optional
 
 class DomainPrior(nn.Module):
     """
@@ -108,135 +109,290 @@ class ClassPrior(nn.Module):
 
         return mu, scale
 
-
-class ProbabilisticEncoder(nn.Module):
+class QZD(nn.Module):
     """
-    Generic VAE-style encoder:
-        q(z | x) = N(mu(x), sigma(x)^2)
-
-    Can be used for:
-        - qzd (domain encoder)
-        - qzy (class encoder)
-        - qzx (shared encoder)
+    q(z_d | x)
+    Domain-specific latent encoder
     """
 
     def __init__(
         self,
-        input_dim: int,
+        *,
+        n_features: int,
         latent_dim: int,
-        hidden_dim: int = 256,
-        num_hidden_layers: int = 2,
-    ):
+    ) -> None:
         super().__init__()
 
-        layers = []
-        dim = input_dim
-        for _ in range(num_hidden_layers):
-            layers.extend([
-                nn.Linear(dim, hidden_dim),
-                nn.ReLU(),
-            ])
-            dim = hidden_dim
+        self.n_features = n_features
 
-        self.backbone = nn.Sequential(*layers)
+        # Convolutional backbone 
+        self.conv1 = nn.Conv2d(n_features, 1024, kernel_size=(1, 5))
+        self.conv2 = nn.Conv2d(1024, 512, kernel_size=(1, 1))
+        self.conv3 = nn.Conv2d(512, 128, kernel_size=(1, 1))
+        self.conv4 = nn.Conv2d(128, 64, kernel_size=(1, 1))
 
-        self.mu_head = nn.Linear(hidden_dim, latent_dim)
-        self.logvar_head = nn.Linear(hidden_dim, latent_dim)
+        self.relu = nn.ReLU(inplace=True)
 
-        self._init_weights()
+        self.pool1 = nn.MaxPool2d((1, 2), stride=2, return_indices=True, ceil_mode=True)
+        self.pool2 = nn.MaxPool2d((1, 2), stride=2, return_indices=True, ceil_mode=True)
+        self.pool3 = nn.MaxPool2d((1, 2), stride=2, return_indices=True, ceil_mode=True)
+        self.pool4 = nn.MaxPool2d((1, 2), stride=2, return_indices=True, ceil_mode=True)
 
-    def _init_weights(self):
-        for m in self.modules():
-            if isinstance(m, nn.Linear):
-                nn.init.xavier_uniform_(m.weight)
-                nn.init.zeros_(m.bias)
-
-    def forward(
-        self,
-        x: torch.Tensor,
-        sample: bool = True,
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """
-        Args:
-            x:      (B, input_dim)
-            sample: if False, returns mu instead of sampled z
-
-        Returns:
-            z:      (B, latent_dim)
-            mu:     (B, latent_dim)
-            logvar: (B, latent_dim)
-        """
-        h = self.backbone(x)
-
-        mu = self.mu_head(h)
-        logvar = self.logvar_head(h)
-
-        # numerical stability
-        logvar = torch.clamp(logvar, -10.0, 10.0)
-
-        if not sample:
-            return mu, mu, logvar
-
-        z = self.reparameterize(mu, logvar)
-        return z, mu, logvar
-
-    @staticmethod
-    def reparameterize(mu: torch.Tensor, logvar: torch.Tensor) -> torch.Tensor:
-        std = torch.exp(0.5 * logvar)
-        eps = torch.randn_like(std)
-        return mu + eps * std
-
-
-class Decoder(nn.Module):
-    """
-    p(x | z_d, z_y [, z_x])
-
-    """
-
-    def __init__(
-        self,
-        latent_dim_activity: int,
-        latent_dim_domain: int,
-        output_dim: int,
-        latent_dim_shared: int = 0,
-        hidden_dim: int = 256,
-    ):
-        super().__init__()
-
-        self.latent_dim_shared = latent_dim_shared
-        total_latent_dim = latent_dim_activity + latent_dim_domain + latent_dim_shared
-
-        self.net = nn.Sequential(
-            nn.Linear(total_latent_dim, hidden_dim),
-            nn.ReLU(),
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.ReLU(),
-            nn.Linear(hidden_dim, output_dim),
+        #  Latent heads 
+        self.fc_mu = nn.Linear(128, latent_dim)
+        self.fc_sigma = nn.Sequential(
+            nn.Linear(128, latent_dim),
+            nn.Softplus()
         )
 
         self._init_weights()
 
     def _init_weights(self) -> None:
-        for m in self.net:
-            if isinstance(m, nn.Linear):
+        for m in self.modules():
+            if isinstance(m, (nn.Conv2d, nn.Linear)):
                 nn.init.xavier_uniform_(m.weight)
-                nn.init.zeros_(m.bias)
+                if m.bias is not None:
+                    nn.init.zeros_(m.bias)
+
+    def forward(
+        self, x: torch.Tensor
+    ) -> Tuple[torch.Tensor, torch.Tensor, Tuple]:
+        """
+        Args:
+            x: Tensor [B, C, 1, T]
+
+        Returns:
+            mu:    [B, latent_dim]
+            sigma: [B, latent_dim]
+            pool_indices: indices for unpooling in decoder
+        """
+        x = x.float()
+
+        # Accept [B, T*F], [B, T, F], or [B, 1, T, F]
+        if x.dim() == 2:
+            # [B, T*F] → [B, T, F]
+            B = x.size(0)
+            x = x.view(B, -1, self.n_features)
+
+        if x.dim() == 3:
+            # [B, T, F] → [B, F, 1, T]
+            x = x.permute(0, 2, 1).unsqueeze(2)
+
+        if x.dim() != 4:
+            raise RuntimeError(f"Unexpected input shape to QZD: {x.shape}")
+        x = self.relu(self.conv1(x))
+        x, idx1 = self.pool1(x)
+
+        x = self.relu(self.conv2(x))
+        x, idx2 = self.pool2(x)
+
+        x = self.relu(self.conv3(x))
+        x, idx3 = self.pool3(x)
+
+        x = self.relu(self.conv4(x))
+        x, idx4 = self.pool4(x)
+
+        # flatten (batch, channels, 1, time) → (batch, features)
+        x = x.flatten(start_dim=1)
+
+        mu = self.fc_mu(x)
+        sigma = self.fc_sigma(x)
+
+        pool_indices = (idx1, idx2, idx3, idx4)
+
+        return mu, sigma, pool_indices, None
+    
+class QZY(nn.Module):
+    """
+    q(z_y | x)
+    Activity-specific latent encoder
+    """
+
+    def __init__(
+        self,
+        *,
+        n_features: int,
+        latent_dim: int,
+    ) -> None:
+        super().__init__()
+        self.n_features = n_features
+
+        # Convolutional backbone 
+        self.conv1 = nn.Conv2d(n_features, 1024, kernel_size=(1, 5))
+        self.conv2 = nn.Conv2d(1024, 512, kernel_size=(1, 1))
+        self.conv3 = nn.Conv2d(512, 128, kernel_size=(1, 1))
+        self.conv4 = nn.Conv2d(128, 64, kernel_size=(1, 1))
+
+        self.relu = nn.ReLU(inplace=True)
+
+        self.pool1 = nn.MaxPool2d((1, 2), stride=2, return_indices=True, ceil_mode=True)
+        self.pool2 = nn.MaxPool2d((1, 2), stride=2, return_indices=True, ceil_mode=True)
+        self.pool3 = nn.MaxPool2d((1, 2), stride=2, return_indices=True, ceil_mode=True)
+        self.pool4 = nn.MaxPool2d((1, 2), stride=2, return_indices=True, ceil_mode=True)
+
+        # Latent heads 
+        self.fc_mu = nn.Linear(128, latent_dim)
+        self.fc_sigma = nn.Sequential(
+            nn.Linear(128, latent_dim),
+            nn.Softplus()
+        )
+
+        self._init_weights()
+
+    def _init_weights(self) -> None:
+        for m in self.modules():
+            if isinstance(m, (nn.Conv2d, nn.Linear)):
+                nn.init.xavier_uniform_(m.weight)
+                if m.bias is not None:
+                    nn.init.zeros_(m.bias)
+
+    def forward(
+        self, x: torch.Tensor
+    ) -> Tuple[
+        torch.Tensor,
+        torch.Tensor,
+        List[torch.Tensor],
+        List[torch.Size],
+    ]:
+        """
+        Args:
+            x: Tensor of shape [B, 1, T, F] or equivalent
+
+        Returns:
+            mu:            [B, latent_dim]
+            sigma:         [B, latent_dim]
+            pool_indices:  list of pooling indices
+            pool_sizes:    list of tensor sizes before pooling
+        """
+
+        x = x.float()
+
+        if x.dim() == 2:
+            # [B, T*F] -> [B, T, F]
+            B = x.size(0)
+            x = x.view(B, -1, self.n_features)
+
+        if x.dim() == 3:
+            # [B, T, F] -> [B, F, 1, T]
+            x = x.permute(0, 2, 1).unsqueeze(2)
+
+        if x.dim() != 4:
+            raise RuntimeError(f"Unexpected input shape to QZY: {x.shape}")
+
+        x = self.relu(self.conv1(x))
+        x, idx1 = self.pool1(x)
+        size1 = x.size()
+
+        x = self.relu(self.conv2(x))
+        x, idx2 = self.pool2(x)
+        size2 = x.size()
+
+        x = self.relu(self.conv3(x))
+        x, idx3 = self.pool3(x)
+        size3 = x.size()
+
+        x = self.relu(self.conv4(x))
+        x, idx4 = self.pool4(x)
+        size4 = x.size()
+
+        # flatten for latent heads
+        x = x.flatten(start_dim=1)
+
+        mu = self.fc_mu(x)
+        sigma = self.fc_sigma(x) + 1e-7
+
+        pool_indices = [idx1, idx2, idx3, idx4]
+        pool_sizes = [size1, size2, size3, size4]
+
+        return mu, sigma, pool_indices, pool_sizes
+    
+
+class PX(nn.Module):
+    """
+    p(x | z_d, z_y [, z_x])
+
+    Decoder using unpooling + transposed convolutions.
+    """
+
+    def __init__(
+        self,
+        *,
+        n_features: int,
+        latent_dim_domain: int,
+        latent_dim_activity: int,
+        latent_dim_shared: int = 0,
+    ) -> None:
+        super().__init__()
+
+        self.n_features = n_features
+        self.latent_dim_shared = latent_dim_shared
+
+        total_latent_dim = latent_dim_domain + latent_dim_activity + latent_dim_shared
+
+        #  Latent projection 
+        self.fc = nn.Sequential(
+            nn.Linear(total_latent_dim, 128, bias=False),
+            nn.BatchNorm1d(128),
+            nn.ReLU(inplace=True),
+        )
+
+        #  Unpool + deconv stack 
+        self.unpool1 = nn.MaxUnpool2d((1, 2), stride=2)
+        self.deconv1 = nn.Sequential(
+            nn.ConvTranspose2d(64, 128, kernel_size=(1, 1)),
+            nn.ReLU(inplace=True),
+        )
+
+        self.unpool2 = nn.MaxUnpool2d((1, 2), stride=2)
+        self.deconv2 = nn.Sequential(
+            nn.ConvTranspose2d(128, 512, kernel_size=(1, 1)),
+            nn.ReLU(inplace=True),
+        )
+
+        self.unpool3 = nn.MaxUnpool2d((1, 2), stride=2)
+        self.deconv3 = nn.Sequential(
+            nn.ConvTranspose2d(512, 1024, kernel_size=(1, 1)),
+            nn.ReLU(inplace=True),
+        )
+
+        self.unpool4 = nn.MaxUnpool2d((1, 2), stride=2)
+        self.deconv4 = nn.Sequential(
+            nn.ConvTranspose2d(
+                1024, n_features, kernel_size=(1, 5)
+            ),
+            nn.ReLU(inplace=True),
+        )
+
+        self._init_weights()
+
+    def _init_weights(self) -> None:
+        for m in self.modules():
+            if isinstance(m, (nn.Linear, nn.ConvTranspose2d)):
+                nn.init.xavier_uniform_(m.weight)
+                if m.bias is not None:
+                    nn.init.zeros_(m.bias)
 
     def forward(
         self,
-        z_activity: torch.Tensor,
         z_domain: torch.Tensor,
+        z_activity: torch.Tensor,
+        pool_indices: List[torch.Tensor],
+        pool_sizes: List[torch.Size],
         z_shared: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """
         Args:
-            z_activity: (B, latent_dim_activity)
-            z_domain:   (B, latent_dim_domain)
-            z_shared:   (B, latent_dim_shared) or None
+            z_domain:    (B, latent_dim_domain)
+            z_activity:  (B, latent_dim_activity)
+            z_shared:    (B, latent_dim_shared) or None
+            pool_indices: list of pooling indices (len=4)
+            pool_sizes:   list of tensor sizes before pooling (len=4)
 
         Returns:
-            x_recon: (B, output_dim)
+            x_recon: (B, 1, T, F) or equivalent
         """
+
+        #  Concatenate latents 
         if self.latent_dim_shared > 0:
             if z_shared is None:
                 raise ValueError("z_shared must be provided when latent_dim_shared > 0")
@@ -244,7 +400,27 @@ class Decoder(nn.Module):
         else:
             z = torch.cat([z_domain, z_activity], dim=1)
 
-        return self.net(z)
+        #  Project to conv feature map 
+        h = self.fc(z)
+        h = h.view(-1, 64, 1, 2)
+
+        #  Unpool + deconv 
+        h = self.unpool1(h, pool_indices[3], output_size=pool_sizes[2])
+        h = self.deconv1(h)
+
+        h = self.unpool2(h, pool_indices[2], output_size=pool_sizes[1])
+        h = self.deconv2(h)
+
+        h = self.unpool3(h, pool_indices[1], output_size=pool_sizes[0])
+        h = self.deconv3(h)
+
+        h = self.unpool4(h, pool_indices[0])
+        h = self.deconv4(h)
+
+        # (B, C, 1, T) → (B, 1, T, C)
+        return h.permute(0, 2, 3, 1)
+
+
 
 
 class LatentClassifier(nn.Module):
@@ -268,34 +444,49 @@ class GILE(nn.Module):
     ):
         super().__init__()
 
+
         # Encoders
-        self.activity_encoder = ProbabilisticEncoder(input_dim, latent_dim)
-        self.domain_encoder = ProbabilisticEncoder(input_dim, latent_dim)
+        self.activity_encoder = QZY(n_features=77, latent_dim=latent_dim, )
+        self.domain_encoder = QZD(n_features=77, latent_dim=latent_dim,)
 
         # Priors
         self.activity_prior = ClassPrior(activity_classes, latent_dim)
         self.domain_prior = DomainPrior(domain_classes, latent_dim)
 
         # Decoder
-        self.decoder = Decoder(
-            latent_dim_activity=latent_dim,
-            latent_dim_domain=latent_dim,
-            output_dim=input_dim,
-        )
+        self.decoder = PX(n_features=77, latent_dim_domain=latent_dim, latent_dim_activity=latent_dim,)
 
         # Disentangling classifiers
         self.activity_classifier = LatentClassifier(latent_dim, activity_classes)
         self.domain_classifier = LatentClassifier(latent_dim, domain_classes)
-        
+
+        self.activity_classifier_ie = LatentClassifier(latent_dim, activity_classes)  # DCy(z_d)
+        self.domain_classifier_ie   = LatentClassifier(latent_dim, domain_classes)    # DCd(z)
+
         # KL weights
         self.beta_activity = beta_activity
         self.beta_domain = beta_domain
 
     def forward(self, x, y, d):
-        z_activity, mu_a, logvar_a = self.activity_encoder(x)
-        z_domain, mu_d, logvar_d = self.domain_encoder(x)
+        mu_a, sigma_a, pool_idx_a, pool_sizes_a = self.activity_encoder(x)
+        mu_d, sigma_d, _, _ = self.domain_encoder(x)
 
-        x_recon = self.decoder(z_activity, z_domain)
+        # reparameterization
+        eps_a = torch.randn_like(sigma_a)
+        eps_d = torch.randn_like(sigma_d)
+
+        z_activity = mu_a + eps_a * sigma_a
+        z_domain   = mu_d + eps_d * sigma_d
+
+        logvar_a = torch.log(sigma_a ** 2 + 1e-8)
+        logvar_d = torch.log(sigma_d ** 2 + 1e-8)
+
+        x_recon = self.decoder(
+            z_domain=z_domain,
+            z_activity=z_activity,
+            pool_indices=pool_idx_a,   # or whichever path you reconstruct from
+            pool_sizes=pool_sizes_a,
+        )
 
         activity_logits = self.activity_classifier(z_activity)
         domain_logits = self.domain_classifier(z_domain)
@@ -315,8 +506,12 @@ class GILE(nn.Module):
         }
     
   
-    def compute_loss(self, x, y, d, pred, beta_kl, aux_y=1.0, aux_d=1.0):
-        recon_loss = F.mse_loss(pred["x_recon"], x, reduction="mean")
+    def compute_loss(self, x, y, d, pred, beta_kl, aux_y=1.0, aux_d=1.0, gamma_ie = 0.2):
+        B = x.size(0)
+        x_recon = pred["x_recon"].reshape(B, -1)
+        x_target = x.view(B, -1)
+
+        recon_loss = F.mse_loss(x_recon, x_target, reduction="sum") / B
 
         #  priors p(z|y), p(z_d|d) 
         mu_a_p, sigma_a_p = self.activity_prior(y)   # (B, latent)
@@ -341,13 +536,27 @@ class GILE(nn.Module):
         kl_a_neg = kl_a_neg.mean()
         kl_d_neg = kl_d_neg.mean()
 
-        # ---------- Auxiliary classifiers ----------
-        ce_y = F.cross_entropy(pred["activity_logits"], y, reduction="mean")
-        ce_d = F.cross_entropy(pred["domain_logits"],   d, reduction="mean")
+        #  Auxiliary classifiers 
+        ce_y = F.cross_entropy(pred["activity_logits"], y, reduction="sum")/ B
+        ce_d = F.cross_entropy(pred["domain_logits"],   d, reduction="sum")/ B
+
+        # Independant Excitation
+        z_domain_grl   = GradReverse.apply(pred["z_domain"],   1.0)  # z_d -> DCy
+        z_activity_grl = GradReverse.apply(pred["z_activity"], 1.0)  # z   -> DCd
+
+        logits_y_from_zd = self.activity_classifier_ie(z_domain_grl)   # DCy(z_d)
+        logits_d_from_z  = self.domain_classifier_ie(z_activity_grl)   # DCd(z)
+
+        ie_y = F.cross_entropy(logits_y_from_zd, y, reduction="sum")/ B
+        ie_d = F.cross_entropy(logits_d_from_z,  d, reduction="sum")/ B
+
 
         # negative ELBO (to minimize): recon_loss - (logp-logq) = recon_loss + KL
         elbo_loss = recon_loss - beta_kl * (kl_a_neg + kl_d_neg)
-        total_loss = elbo_loss + aux_y * ce_y + aux_d * ce_d
+        dc_loss =  aux_y * ce_y + aux_d * ce_d
+
+        ie_loss = ie_y + ie_d
+        total_loss = elbo_loss + dc_loss + gamma_ie * ie_loss
         return total_loss
 
 def kl_divergence(logvar_q, logvar_p, mu_q, mu_p):

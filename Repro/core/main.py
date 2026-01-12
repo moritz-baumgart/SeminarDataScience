@@ -1,21 +1,25 @@
 from torch.utils.data import DataLoader
-from oppor_dataloader import build_opportunity_loader
+#from oppor_dataloader import build_opportunity_loader
 from model_GLIE import kl_divergence, GILE
 from utils import GradReverse
 import torch
 import torch.nn.functional as F
 from sklearn.metrics import f1_score
-
+from oppor_prepro_dataloader import build_opportunity_loader
 
 # hyperparameter
-beta_kl = 0.8     # KL-Regularisierung
+beta_kl = 0.1    # KL-Regularisierung
 alpha_cls = 1.0    # Klassifikations-Loss
-gamma_ie = 0.5     # Independent Excitation
-
+gamma_ie = 0.2     # Independent Excitation
+aux_y    = 1.0
+aux_d    = 1.0
 
 # device
 device = "cuda" if torch.cuda.is_available() else "cpu"
-
+print(torch.cuda.is_available())
+print(torch.__version__)
+print(torch.version.cuda)
+print(torch.backends.cuda.is_built())
 
 # dataloader (LOSO)
 train_loader = build_opportunity_loader(
@@ -35,19 +39,18 @@ test_loader = build_opportunity_loader(
 
 # model
 model = GILE(
-    input_dim=24*77,
+    input_dim=30*77,
     activity_classes=18,
     domain_classes=4,
     latent_dim=16,
 ).to(device)
-
-optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
+print(device)
+optimizer = torch.optim.Adam(model.parameters(), lr=1e-3, weight_decay= 1e-3)
 
 
 def train_one_epoch(model, loader):
     model.train()
     total_loss = 0.0
-
     for x, y, d in loader:
         x = x.to(device)
         y = y.to(device)
@@ -55,7 +58,7 @@ def train_one_epoch(model, loader):
 
         out = model(x, y, d)
 
-        loss = model.compute_loss(x,y,d,out,beta_kl)
+        loss = model.compute_loss(x, y, d, out, beta_kl, aux_y, aux_d, gamma_ie)
 
         optimizer.zero_grad()
         loss.backward()
@@ -160,9 +163,9 @@ for epoch in range(500):
     loss = train_one_epoch(model, train_loader)
     metrics = evaluate(model, test_loader)
     print(
-        f"Epoch {epoch:02d} | "
-        f"Train Loss: {loss:.4f} | "
-        f"Act F1 (macro): {metrics['activity_f1_macro']:.3f} | "
-        f"Act F1 (weighted): {metrics['activity_f1_weighted']:.3f} | "
-        f"Domain F1 (weighted): {metrics['domain_f1_macro']:.3f}"
-    )
+            f"Epoch {epoch:02d} | "
+            f"Train Loss: {loss:.4f} | "
+            f"Act F1 (macro): {metrics['activity_f1_macro']:.3f} | "
+            f"Act F1 (weighted): {metrics['activity_f1_weighted']:.3f} | "
+            f"Domain F1 (weighted): {metrics['domain_f1_macro']:.3f}"
+        )
