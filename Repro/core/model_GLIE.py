@@ -506,58 +506,82 @@ class GILE(nn.Module):
         }
     
   
-    def compute_loss(self, x, y, d, pred, beta_kl, aux_y=1.0, aux_d=1.0, gamma_ie = 0.2):
+    def compute_loss_main(
+    self,
+    x,
+    y,
+    d,
+    pred,
+    beta_kl,
+    aux_y: float = 1.0,
+    aux_d: float = 1.0,
+    gamma_ie: float = 0.2,
+):
         B = x.size(0)
-        x_recon = pred["x_recon"].reshape(B, -1)
-        x_target = x.view(B, -1)
-
+        x_recon  = pred["x_recon"].reshape(B, -1)
+        x_target = x.reshape(B, -1)
         recon_loss = F.mse_loss(x_recon, x_target, reduction="sum") / B
 
-        #  priors p(z|y), p(z_d|d) 
-        mu_a_p, sigma_a_p = self.activity_prior(y)   # (B, latent)
-        mu_d_p, sigma_d_p = self.domain_prior(d)     # (B, latent
+        mu_a_p, sigma_a_p = self.activity_prior(y)
+        mu_d_p, sigma_d_p = self.domain_prior(d)
 
-        #  posteriors q(z|x), q(z_d|x) 
         std_a_q = torch.exp(0.5 * pred["logvar_a"])
         std_d_q = torch.exp(0.5 * pred["logvar_d"])
-        
-        # encoder predicted latent Dist
+
         q_a = dist.Independent(dist.Normal(pred["mu_a"], std_a_q), 1)
         q_d = dist.Independent(dist.Normal(pred["mu_d"], std_d_q), 1)
 
-        # model expected latnet Dist
         p_a = dist.Independent(dist.Normal(mu_a_p, sigma_a_p), 1)
         p_d = dist.Independent(dist.Normal(mu_d_p, sigma_d_p), 1)
 
-       # E_q[log p - log q] = -KL(q||p)
-        kl_a_neg = (p_a.log_prob(pred["z_activity"]) - q_a.log_prob(pred["z_activity"]))  # (B,)
-        kl_d_neg = (p_d.log_prob(pred["z_domain"])   - q_d.log_prob(pred["z_domain"]))    # (B,)
+        kl_a_neg = (p_a.log_prob(pred["z_activity"]) - q_a.log_prob(pred["z_activity"])).mean()
+        kl_d_neg = (p_d.log_prob(pred["z_domain"])   - q_d.log_prob(pred["z_domain"])).mean()
 
-        kl_a_neg = kl_a_neg.mean()
-        kl_d_neg = kl_d_neg.mean()
+        ce_y = F.cross_entropy(pred["activity_logits"], y, reduction="sum") / B
+        ce_d = F.cross_entropy(pred["domain_logits"],   d, reduction="sum") / B
+        dc_loss = aux_y * ce_y + aux_d * ce_d
 
-        #  Auxiliary classifiers 
-        ce_y = F.cross_entropy(pred["activity_logits"], y, reduction="sum")/ B
-        ce_d = F.cross_entropy(pred["domain_logits"],   d, reduction="sum")/ B
-
-        # Independant Excitation
-        z_domain_grl   = GradReverse.apply(pred["z_domain"],   1.0)  # z_d -> DCy
-        z_activity_grl = GradReverse.apply(pred["z_activity"], 1.0)  # z   -> DCd
-
-        logits_y_from_zd = self.activity_classifier_ie(z_domain_grl)   # DCy(z_d)
-        logits_d_from_z  = self.domain_classifier_ie(z_activity_grl)   # DCd(z)
-
-        ie_y = F.cross_entropy(logits_y_from_zd, y, reduction="sum")/ B
-        ie_d = F.cross_entropy(logits_d_from_z,  d, reduction="sum")/ B
-
-
-        # negative ELBO (to minimize): recon_loss - (logp-logq) = recon_loss + KL
         elbo_loss = recon_loss - beta_kl * (kl_a_neg + kl_d_neg)
-        dc_loss =  aux_y * ce_y + aux_d * ce_d
 
+        # IE (adversarial) -> GRL rein, vorzeichen bleibt "+"
+        z_d_grl = GradReverse.apply(pred["z_domain"],   1.0)  # z_domain -> predict y
+        z_y_grl = GradReverse.apply(pred["z_activity"], 1.0)  # z_activity -> predict d
+
+        logits_y_from_zd = self.activity_classifier_ie(z_d_grl)
+        logits_d_from_zy = self.domain_classifier_ie(z_y_grl)
+
+        ie_y = F.cross_entropy(logits_y_from_zd, y, reduction="sum") / B
+        ie_d = F.cross_entropy(logits_d_from_zy, d, reduction="sum") / B
         ie_loss = ie_y + ie_d
-        total_loss = elbo_loss + dc_loss + gamma_ie * ie_loss
-        return total_loss
+
+        # main objective: minimize elbo + dc, and (via GRL) remove leakage
+        total_main = elbo_loss + dc_loss #+ gamma_ie * ie_loss
+        return total_main
+
+
+
+    def compute_loss_ie(
+        self,
+        y,
+        d,
+        pred,
+    ):
+        """
+        IE / false step (optimizer_ie):
+        train ONLY the IE heads to be good at predicting the wrong thing.
+        -> detach latents so encoders dont move in this step
+        """
+        z_d = pred["z_domain"].detach()
+        z_y = pred["z_activity"].detach()
+
+        logits_y_from_zd = self.activity_classifier_ie(z_d)
+        logits_d_from_zy = self.domain_classifier_ie(z_y)
+
+        ie_y = F.cross_entropy(logits_y_from_zd, y, reduction="mean")
+        ie_d = F.cross_entropy(logits_d_from_zy, d, reduction="mean")
+
+        return ie_y + ie_d
+
 
 def kl_divergence(logvar_q, logvar_p, mu_q, mu_p):
     # returns mean KL over batch

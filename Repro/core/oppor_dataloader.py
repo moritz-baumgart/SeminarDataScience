@@ -20,8 +20,11 @@ DATA_ROOT = Path("./data/OpportunityUCIDataset/dataset/")
 CACHE_DIR = Path("./data/oppor/cache/")
 CACHE_DIR.mkdir(parents=True, exist_ok=True)
 
-WINDOW_SIZE = int(os.getenv("OPP_WINDOW_SIZE", "24"))
-STEP_SIZE   = int(os.getenv("OPP_STEP_SIZE", "24")) 
+WINDOW_SIZE = 30
+STEP_SIZE   = 15
+
+#WINDOW_SIZE = int(os.getenv("OPP_WINDOW_SIZE", "24"))
+#STEP_SIZE   = int(os.getenv("OPP_STEP_SIZE", "12")) 
 
 
 # Dataset

@@ -16,10 +16,6 @@ aux_d    = 1.0
 
 # device
 device = "cuda" if torch.cuda.is_available() else "cpu"
-print(torch.cuda.is_available())
-print(torch.__version__)
-print(torch.version.cuda)
-print(torch.backends.cuda.is_built())
 
 # dataloader (LOSO)
 train_loader = build_opportunity_loader(
@@ -45,28 +41,63 @@ model = GILE(
     latent_dim=16,
 ).to(device)
 print(device)
-optimizer = torch.optim.Adam(model.parameters(), lr=1e-3, weight_decay= 1e-3)
 
 
-def train_one_epoch(model, loader):
+ie_params = (
+    list(model.activity_classifier_ie.parameters()) +
+    list(model.domain_classifier_ie.parameters())
+)
+
+main_params = []
+for name, p in model.named_parameters():
+    if name.startswith("activity_classifier_ie") or name.startswith("domain_classifier_ie"):
+        continue
+    main_params.append(p)
+
+opt_main = torch.optim.Adam(main_params, lr=1e-3, weight_decay=1e-3)
+opt_ie   = torch.optim.Adam(ie_params,   lr=1e-3, weight_decay=1e-3)
+
+def train_one_epoch(model, loader, opt_main, opt_ie):
     model.train()
-    total_loss = 0.0
+    total_main = 0.0
+    total_ie = 0.0
+
     for x, y, d in loader:
         x = x.to(device)
         y = y.to(device)
         d = d.to(device)
 
+        # (1) IE / false step
+        # train ONLY IE heads, encoders must NOT move (detach is inside compute_loss_ie)
         out = model(x, y, d)
 
-        loss = model.compute_loss(x, y, d, out, beta_kl, aux_y, aux_d, gamma_ie)
+        loss_ie = model.compute_loss_ie(y, d, out)
 
-        optimizer.zero_grad()
-        loss.backward()
-        optimizer.step()
+        opt_ie.zero_grad(set_to_none=True)
+        loss_ie.backward()
+        opt_ie.step()
 
-        total_loss += loss.item()
+        total_ie += loss_ie.item()
 
-    return total_loss / len(loader)
+        # (2) main step
+        # train encoder/decoder/priors + true heads, and confuse IE heads via -gamma * ie_loss
+        out = model(x, y, d)  # recompute forward (safer after step 1)
+
+        loss_main = model.compute_loss_main(x, y, d, out, beta_kl, aux_y, aux_d, gamma_ie)
+
+        opt_main.zero_grad(set_to_none=True)
+        loss_main.backward()
+        opt_main.step()
+
+        total_main += loss_main.item()
+
+    return {
+        "loss_main": total_main / len(loader),
+        "loss_ie": total_ie / len(loader),
+        "loss_total": (total_main + total_ie) / len(loader),
+    }
+
+
 
 @torch.no_grad()
 def evaluate(model, loader):
@@ -160,11 +191,13 @@ def eval(model, loader):
 
 # training
 for epoch in range(500):
-    loss = train_one_epoch(model, train_loader)
+    loss = train_one_epoch(model, train_loader, opt_main, opt_ie)
     metrics = evaluate(model, test_loader)
     print(
             f"Epoch {epoch:02d} | "
-            f"Train Loss: {loss:.4f} | "
+            f"Train Loss main: {loss["loss_main"]:.4f} | "
+            f"Train Loss ie: {loss["loss_ie"]:.4f} | "
+            f"Train Loss total: {loss["loss_total"]:.4f} | "
             f"Act F1 (macro): {metrics['activity_f1_macro']:.3f} | "
             f"Act F1 (weighted): {metrics['activity_f1_weighted']:.3f} | "
             f"Domain F1 (weighted): {metrics['domain_f1_macro']:.3f}"
