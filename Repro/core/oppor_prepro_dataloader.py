@@ -19,7 +19,7 @@ CACHE_DIR = Path("./data/oppor/cache/")
 CACHE_DIR.mkdir(parents=True, exist_ok=True)
 
 WINDOW_SIZE = 30
-STEP_SIZE   = 24
+STEP_SIZE   = 15
 
 
 def _preprocessed_candidates(domain_id: str, label_type: str) -> List[Path]:
@@ -101,7 +101,7 @@ def _windowize_opportunity(
     window_size: int,
     step_size: int,
     drop_null: bool = True,
-    label_strategy: str = "mode",   # "mode" or "last"
+    label_strategy: str = "last",   # "mode" or "last"
     flatten: bool = True,
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
     """
@@ -211,7 +211,7 @@ def build_opportunity_loader(
         y = dataset.y
         num_classes = int(torch.max(y).item()) + 1
         counts = torch.bincount(y, minlength=num_classes).float().clamp_min(1.0)
-        class_w = 1.0 / counts
+        class_w = 100.0 / counts
         sample_w = class_w[y].double()
 
         sampler = WeightedRandomSampler(

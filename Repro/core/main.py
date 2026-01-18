@@ -8,26 +8,33 @@ from sklearn.metrics import f1_score
 from oppor_prepro_dataloader import build_opportunity_loader
 
 # hyperparameter
-beta_kl = 0.1    # KL-Regularisierung
-alpha_cls = 1.0    # Klassifikations-Loss
-gamma_ie = 0.2     # Independent Excitation
-aux_y    = 1.0
-aux_d    = 1.0
+aux_loss_multiplier_y = 1000
+aux_loss_multiplier_d = 1000
+beta_d = 0.002
+beta_y = 10
+weight_true = 1000
+weight_false = 1000
+latent_dim = 50
 
 # device
 device = "cuda" if torch.cuda.is_available() else "cpu"
 
-# dataloader (LOSO)
-train_loader = build_opportunity_loader(
-    domain_ids=["S1", "S2", "S3"],
-    batch_size=64,
-    shuffle=True,
-    label_type="gestures",
-)
+SOURCE_DOMAINS = ["S1", "S2", "S3"]
+TARGET_DOMAIN  = "S4"
+
+train_loaders = [
+    build_opportunity_loader(
+        domain_ids=[dom],      # IMPORTANT: list, not string
+        batch_size=64,
+        shuffle=True,
+        label_type="gestures",
+    )
+    for dom in SOURCE_DOMAINS
+]
 
 test_loader = build_opportunity_loader(
-    domain_ids=["S4"],
-    batch_size=64,
+    domain_ids=[TARGET_DOMAIN],  # IMPORTANT: list, not string
+    batch_size=512,
     shuffle=False,
     label_type="gestures",
 )
@@ -38,167 +45,173 @@ model = GILE(
     input_dim=30*77,
     activity_classes=18,
     domain_classes=4,
-    latent_dim=16,
+    latent_dim=latent_dim,
+    weight_true = weight_true,
+    weight_false = weight_false,
+    beta_domain= beta_d,
+    beta_activity= beta_y,
+    aux_loss_multiplier_y= aux_loss_multiplier_y,
+    aux_loss_multiplier_d= aux_loss_multiplier_d,
+    zx_dim= 0,
+
 ).to(device)
 print(device)
 
 
-ie_params = (
-    list(model.activity_classifier_ie.parameters()) +
-    list(model.domain_classifier_ie.parameters())
+main_params = (
+    list(model.activity_encoder.parameters()) +
+    list(model.domain_encoder.parameters()) +
+    (list(model.qzx.parameters()) if getattr(model, "zx_dim", 0) != 0 else []) +
+    list(model.decoder.parameters()) +
+    list(model.activity_prior.parameters()) +
+    list(model.domain_prior.parameters()) 
 )
 
-main_params = []
-for name, p in model.named_parameters():
-    if name.startswith("activity_classifier_ie") or name.startswith("domain_classifier_ie"):
-        continue
-    main_params.append(p)
+ie_params = (
+    list(model.activity_classifier.parameters()) +
+    list(model.domain_classifier.parameters())
+)
 
-opt_main = torch.optim.Adam(main_params, lr=1e-3, weight_decay=1e-3)
-opt_ie   = torch.optim.Adam(ie_params,   lr=1e-3, weight_decay=1e-3)
+# optional safety check: no overlap
+assert not (set(map(id, main_params)) & set(map(id, ie_params)))
 
-def train_one_epoch(model, loader, opt_main, opt_ie):
+opt_main = torch.optim.Adam(main_params, lr=1e-4)
+opt_ie   = torch.optim.Adam(ie_params, lr=1e-3)
+
+def train_one_epoch(model, train_loaders, opt_main, opt_ie):
     model.train()
+
     total_main = 0.0
     total_ie = 0.0
+    total = 0
 
-    for x, y, d in loader:
-        x = x.to(device)
-        y = y.to(device)
-        d = d.to(device)
+    for loader in train_loaders:
+        for x, y, d in loader:
+            x = x.to(device, non_blocking=True)
+            y = y.to(device, non_blocking=True)
+            d = d.to(device, non_blocking=True)
 
-        # (1) IE / false step
-        # train ONLY IE heads, encoders must NOT move (detach is inside compute_loss_ie)
-        out = model(x, y, d)
+            batch_size = x.size(0)
+            total += batch_size
 
-        loss_ie = model.compute_loss_ie(y, d, out)
+            # --------------------------------------------------
+            # (1) MAIN STEP
+            # train encoder / decoder / priors / true classifiers
+            # --------------------------------------------------
+            opt_main.zero_grad(set_to_none=True)
 
-        opt_ie.zero_grad(set_to_none=True)
-        loss_ie.backward()
-        opt_ie.step()
+            out = model(x, y, d)
+            loss_main, _ = model.compute_loss_main(x=x, y=y, d=d, pred=out)
 
-        total_ie += loss_ie.item()
+            loss_main.backward()
+            opt_main.step()
 
-        # (2) main step
-        # train encoder/decoder/priors + true heads, and confuse IE heads via -gamma * ie_loss
-        out = model(x, y, d)  # recompute forward (safer after step 1)
+            total_main += loss_main.item() * batch_size
 
-        loss_main = model.compute_loss_main(x, y, d, out, beta_kl, aux_y, aux_d, gamma_ie)
+            # --------------------------------------------------
+            # (2) IE / FALSE STEP
+            # train ONLY IE heads (i.e., only params in opt_ie)
+            # --------------------------------------------------
+            opt_ie.zero_grad(set_to_none=True)
 
-        opt_main.zero_grad(set_to_none=True)
-        loss_main.backward()
-        opt_main.step()
+            # Important: recompute forward path if your loss_function_false
+            # depends on stochastic sampling. If it's deterministic, you can keep it.
+            loss_ie = model.loss_function_false(x, y, d)
 
-        total_main += loss_main.item()
+            loss_ie.backward()
+            opt_ie.step()
 
+            total_ie += loss_ie.item() * batch_size
+
+    denom = max(total, 1)
     return {
-        "loss_main": total_main / len(loader),
-        "loss_ie": total_ie / len(loader),
-        "loss_total": (total_main + total_ie) / len(loader),
+        "loss_main": total_main / denom,
+        "loss_ie": total_ie / denom,
+        "loss_total": (total_main + total_ie) / denom,
     }
 
 
-
 @torch.no_grad()
-def evaluate(model, loader):
+def evaluate(model, loaders):
     model.eval()
+    if not isinstance(loaders, (list, tuple)):
+        loaders = [loaders]
 
-    all_y_true = []
-    all_y_pred = []
+    all_y_true, all_y_pred = [], []
+    all_d_true, all_d_pred = [], []
+    correct_y = correct_d = total = 0
 
-    all_d_true = []
-    all_d_pred = []
+    for loader in loaders:
+        for x, y, d in loader:
+            x, y, d = x.to(device), y.to(device), d.to(device)
 
-    for x, y, d in loader:
-        x = x.to(device)
-        y = y.to(device)
-        d = d.to(device)
+            d_hat, y_hat, d_false, y_false = model.classify(x)
+            y_pred = torch.argmax(y_hat, dim=1)
+            d_pred = torch.argmax(d_hat, dim=1)
 
-        out = model(x, y, d)
+            all_y_true.append(y.detach().cpu())
+            all_y_pred.append(y_pred.detach().cpu())
+            all_d_true.append(d.detach().cpu())
+            all_d_pred.append(d_pred.detach().cpu())
 
-        # Activity predictions
-        y_pred = torch.argmax(out["activity_logits"], dim=1)
+            correct_y += (y_pred == y).sum().item()
+            correct_d += (d_pred == d).sum().item()
+            total += y.size(0)
 
-        all_y_true.append(y.cpu())
-        all_y_pred.append(y_pred.cpu())
-
-        # (optional) Domain predictions
-        d_pred = torch.argmax(out["domain_logits"], dim=1)
-        all_d_true.append(d.cpu())
-        all_d_pred.append(d_pred.cpu())
-
+    # concatenate for F1
     y_true = torch.cat(all_y_true).numpy()
     y_pred = torch.cat(all_y_pred).numpy()
 
     d_true = torch.cat(all_d_true).numpy()
     d_pred = torch.cat(all_d_pred).numpy()
 
+    # F1 metrics 
     activity_f1_macro = f1_score(y_true, y_pred, average="macro")
     activity_f1_weighted = f1_score(y_true, y_pred, average="weighted")
-
     domain_f1_macro = f1_score(d_true, d_pred, average="macro")
 
+    # accuracy metrics (authors' evaluation)
+    #activity_accuracy = correct_y / max(total, 1)
+    #domain_accuracy = correct_d / max(total, 1)
+
+    # accuracy metrics (authors' evaluation: correct / (n_batches * batch_size))
+    batch_size = getattr(loader, "batch_size", None) or 1
+    n_batches = len(all_y_true)  # you append once per batch
+    denom_authors = max(n_batches * batch_size, 1)
+
+    activity_accuracy = correct_y / denom_authors
+    domain_accuracy = correct_d / denom_authors
     return {
         "activity_f1_macro": activity_f1_macro,
         "activity_f1_weighted": activity_f1_weighted,
         "domain_f1_macro": domain_f1_macro,
-    }
-@torch.no_grad()
-def eval(model, loader):
-    model.eval()
-
-    all_y_true = []
-    all_y_pred = []
-
-    all_d_true = []
-    all_d_pred = []
-
-    for x, y, d in loader:
-        x = x.to(device)
-        y = y.to(device)
-        d = d.to(device)
-
-        out = model(x, y, d)
-
-        # Activity predictions
-        y_pred = torch.argmax(out["activity_logits"], dim=1)
-
-        all_y_true.append(y.cpu())
-        all_y_pred.append(y_pred.cpu())
-
-        # (optional) Domain predictions
-        d_pred = torch.argmax(out["domain_logits"], dim=1)
-        all_d_true.append(d.cpu())
-        all_d_pred.append(d_pred.cpu())
-
-    y_true = torch.cat(all_y_true).numpy()
-    y_pred = torch.cat(all_y_pred).numpy()
-
-    d_true = torch.cat(all_d_true).numpy()
-    d_pred = torch.cat(all_d_pred).numpy()
-
-    activity_f1_macro = f1_score(y_true, y_pred, average="macro")
-    activity_f1_weighted = f1_score(y_true, y_pred, average="weighted")
-
-    domain_f1_macro = f1_score(d_true, d_pred, average="macro")
-
-    return {
-        "activity_f1_macro": activity_f1_macro,
-        "activity_f1_weighted": activity_f1_weighted,
-        "domain_f1_macro": domain_f1_macro,
+        "activity_accuracy": activity_accuracy,
+        "domain_accuracy": domain_accuracy,
     }
 
 
-# training
 for epoch in range(500):
-    loss = train_one_epoch(model, train_loader, opt_main, opt_ie)
-    metrics = evaluate(model, test_loader)
+    loss = train_one_epoch(model, train_loaders, opt_main, opt_ie)
+    metrics_train = evaluate(model, train_loaders)
+    metrics_test  = evaluate(model, [test_loader])
     print(
             f"Epoch {epoch:02d} | "
             f"Train Loss main: {loss["loss_main"]:.4f} | "
             f"Train Loss ie: {loss["loss_ie"]:.4f} | "
             f"Train Loss total: {loss["loss_total"]:.4f} | "
-            f"Act F1 (macro): {metrics['activity_f1_macro']:.3f} | "
-            f"Act F1 (weighted): {metrics['activity_f1_weighted']:.3f} | "
-            f"Domain F1 (weighted): {metrics['domain_f1_macro']:.3f}"
+            f"Act F1 (macro): {metrics_test['activity_f1_macro']:.3f} | "
+            f"Act F1 (weighted): {metrics_test['activity_f1_weighted']:.3f} | "
+            f"activity_accuracy: {metrics_test['activity_accuracy']:.3f} | "
+            f"domain_accuracy: {metrics_test['domain_accuracy']:.3f} | "
+            f"Domain F1 (weighted): {metrics_test['domain_f1_macro']:.3f}"
+
+
         )
+    print(
+            f"Act F1 (macro): {metrics_train['activity_f1_macro']:.3f} | "
+            f"Act F1 (weighted): {metrics_train['activity_f1_weighted']:.3f} | "
+            f"activity_accuracy: {metrics_train['activity_accuracy']:.3f} | "
+            f"domain_accuracy: {metrics_train['domain_accuracy']:.3f} | "
+            f"Domain F1 (weighted): {metrics_train['domain_f1_macro']:.3f}"
+
+    )

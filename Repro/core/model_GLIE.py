@@ -305,6 +305,99 @@ class QZY(nn.Module):
         pool_sizes = [size1, size2, size3, size4]
 
         return mu, sigma, pool_indices, pool_sizes
+
+class QZX(nn.Module):
+    """
+    q(z_x | x)
+    Content-specific latent encoder
+    """
+
+    def __init__(
+        self,
+        *,
+        n_features: int,
+        latent_dim: int,
+    ) -> None:
+        super().__init__()
+
+        self.n_features = n_features
+
+        # Convolutional backbone
+        self.conv1 = nn.Conv2d(n_features, 1024, kernel_size=(1, 5))
+        self.conv2 = nn.Conv2d(1024, 512, kernel_size=(1, 1))
+        self.conv3 = nn.Conv2d(512, 128, kernel_size=(1, 1))
+        self.conv4 = nn.Conv2d(128, 64, kernel_size=(1, 1))
+
+        self.relu = nn.ReLU(inplace=True)
+
+        self.pool1 = nn.MaxPool2d((1, 2), stride=2, return_indices=True, ceil_mode=True)
+        self.pool2 = nn.MaxPool2d((1, 2), stride=2, return_indices=True, ceil_mode=True)
+        self.pool3 = nn.MaxPool2d((1, 2), stride=2, return_indices=True, ceil_mode=True)
+        self.pool4 = nn.MaxPool2d((1, 2), stride=2, return_indices=True, ceil_mode=True)
+
+        # Latent heads
+        self.fc_mu = nn.Linear(128, latent_dim)
+        self.fc_sigma = nn.Sequential(
+            nn.Linear(128, latent_dim),
+            nn.Softplus()
+        )
+
+        self._init_weights()
+
+    def _init_weights(self) -> None:
+        for m in self.modules():
+            if isinstance(m, (nn.Conv2d, nn.Linear)):
+                nn.init.xavier_uniform_(m.weight)
+                if m.bias is not None:
+                    nn.init.zeros_(m.bias)
+
+    def forward(
+        self, x: torch.Tensor
+    ) -> Tuple[torch.Tensor, torch.Tensor, Tuple]:
+        """
+        Args:
+            x: Tensor [B, C, 1, T] or [B, T, F] or [B, T*F]
+
+        Returns:
+            mu:    [B, latent_dim]
+            sigma: [B, latent_dim]
+            pool_indices: for unpooling in decoder
+        """
+        x = x.float()
+
+        # Accept [B, T*F], [B, T, F], or [B, 1, T, F]
+        if x.dim() == 2:
+            B = x.size(0)
+            x = x.view(B, -1, self.n_features)
+
+        if x.dim() == 3:
+            x = x.permute(0, 2, 1).unsqueeze(2)
+
+        if x.dim() != 4:
+            raise RuntimeError(f"Unexpected input shape to QZX: {x.shape}")
+
+        x = self.relu(self.conv1(x))
+        x, idx1 = self.pool1(x)
+
+        x = self.relu(self.conv2(x))
+        x, idx2 = self.pool2(x)
+
+        x = self.relu(self.conv3(x))
+        x, idx3 = self.pool3(x)
+
+        x = self.relu(self.conv4(x))
+        x, idx4 = self.pool4(x)
+
+        # (B, C, 1, T) -> (B, features)
+        x = x.flatten(start_dim=1)
+
+        mu = self.fc_mu(x)
+        sigma = self.fc_sigma(x) + 1e-7
+
+        pool_indices = (idx1, idx2, idx3, idx4)
+
+        return mu, sigma, pool_indices, None
+    
     
 
 class PX(nn.Module):
@@ -439,16 +532,24 @@ class GILE(nn.Module):
         activity_classes,
         domain_classes,
         latent_dim=32,
-        beta_domain=1.0,
-        beta_activity=1.0,
-    ):
+        beta_domain=0.002,
+        beta_activity=10,
+        beta_rest=0.1,
+        aux_loss_multiplier_y = 1000,
+        aux_loss_multiplier_d = 1000,
+        weight_true =1000,
+        weight_false=1000,
+        zx_dim =0,     ):
         super().__init__()
 
+        self.zx_dim = zx_dim
 
         # Encoders
         self.activity_encoder = QZY(n_features=77, latent_dim=latent_dim, )
         self.domain_encoder = QZD(n_features=77, latent_dim=latent_dim,)
 
+        if self.zx_dim != 0:
+            self.qzx = QZX(n_features=77, latent_dim=latent_dim,)
         # Priors
         self.activity_prior = ClassPrior(activity_classes, latent_dim)
         self.domain_prior = DomainPrior(domain_classes, latent_dim)
@@ -457,130 +558,164 @@ class GILE(nn.Module):
         self.decoder = PX(n_features=77, latent_dim_domain=latent_dim, latent_dim_activity=latent_dim,)
 
         # Disentangling classifiers
-        self.activity_classifier = LatentClassifier(latent_dim, activity_classes)
-        self.domain_classifier = LatentClassifier(latent_dim, domain_classes)
-
-        self.activity_classifier_ie = LatentClassifier(latent_dim, activity_classes)  # DCy(z_d)
-        self.domain_classifier_ie   = LatentClassifier(latent_dim, domain_classes)    # DCd(z)
+        self.activity_classifier = LatentClassifier(latent_dim, activity_classes)   # z_y -> y
+        self.domain_classifier   = LatentClassifier(latent_dim, domain_classes)     # z_d -> d
 
         # KL weights
-        self.beta_activity = beta_activity
-        self.beta_domain = beta_domain
+        self.beta_d  = beta_domain
+        self.beta_y  = beta_activity
+        self.beta_x = beta_rest
+        self.aux_loss_multiplier_d =aux_loss_multiplier_d
+        self.aux_loss_multiplier_y =aux_loss_multiplier_y
+
+        self.weight_true = weight_true
+        self.weight_false = weight_false
 
     def forward(self, x, y, d):
+        #q_loc. q_scale
         mu_a, sigma_a, pool_idx_a, pool_sizes_a = self.activity_encoder(x)
         mu_d, sigma_d, _, _ = self.domain_encoder(x)
+        
+        if self.zx_dim != 0:
+            zx_q_loc, zx_q_scale, _, _ = self.qzx(x)
+        
+        if self.zx_dim != 0:
+            qzx = dist.Normal(zx_q_loc, zx_q_scale)
+            zx_q = qzx.rsample()
+        else:
+            qzx = None
+            zx_q = None
 
+        qzd = dist.Normal(mu_d, sigma_d)
+
+        qzy = dist.Normal(mu_a, sigma_a)
+        
         # reparameterization
-        eps_a = torch.randn_like(sigma_a)
-        eps_d = torch.randn_like(sigma_d)
+        zy_q = qzy.rsample()
+        zd_q = qzd.rsample()        
 
-        z_activity = mu_a + eps_a * sigma_a
-        z_domain   = mu_d + eps_d * sigma_d
 
-        logvar_a = torch.log(sigma_a ** 2 + 1e-8)
-        logvar_d = torch.log(sigma_d ** 2 + 1e-8)
-
+        # decode
         x_recon = self.decoder(
-            z_domain=z_domain,
-            z_activity=z_activity,
+            z_domain=zd_q,
+            z_activity=zy_q,
             pool_indices=pool_idx_a,   # or whichever path you reconstruct from
             pool_sizes=pool_sizes_a,
+            z_shared = zx_q,
         )
 
-        activity_logits = self.activity_classifier(z_activity)
-        domain_logits = self.domain_classifier(z_domain)
+        zy_p_loc, zy_p_scale = self.activity_prior(y)
+        zd_p_loc, zd_p_scale = self.domain_prior(d)
+        
+        if self.zx_dim != 0:
+            zx_p_loc, zx_p_scale = torch.zeros(zd_p_loc.size()[0], self.zx_dim).cuda(),\
+                                   torch.ones(zd_p_loc.size()[0], self.zx_dim).cuda()
+
+        # Reparameterization trick
+        pzd = dist.Normal(zd_p_loc, zd_p_scale)
+        pzy = dist.Normal(zy_p_loc, zy_p_scale)
+
+        if self.zx_dim != 0:
+            pzx = dist.Normal(zx_p_loc, zx_p_scale)
+        else:
+            pzx = None
+        # Auxiliary losses
+        y_hat  = self.activity_classifier(zy_q)
+        d_hat  = self.domain_classifier(zd_q)
+
 
         return {
             "x_recon": x_recon,
-            "mu_a": mu_a,
-            "logvar_a": logvar_a,
-            "mu_d": mu_d,
-            "logvar_d": logvar_d,
-            "activity_logits": activity_logits,
-            "domain_logits": domain_logits,
-            "z_domain": z_domain,
-            "z_activity" : z_activity,
-            "y": y,
-            "d": d,
+            "d_hat": d_hat,
+            "y_hat": y_hat,
+            "qzx" : qzx,
+            "pzx" : pzx,
+            "zx_q" : zx_q,
+            "qzd": qzd,
+            "pzd": pzd,
+            "zd_q": zd_q,
+            "qzy": qzy,
+            "pzy": pzy,
+            "zy_q": zy_q
+
         }
     
   
-    def compute_loss_main(
-    self,
-    x,
-    y,
-    d,
-    pred,
-    beta_kl,
-    aux_y: float = 1.0,
-    aux_d: float = 1.0,
-    gamma_ie: float = 0.2,
-):
+    def compute_loss_main(self, x, y, d, pred,):
         B = x.size(0)
         x_recon  = pred["x_recon"].reshape(B, -1)
         x_target = x.reshape(B, -1)
-        recon_loss = F.mse_loss(x_recon, x_target, reduction="sum") / B
+        CE_x  = F.mse_loss(x_recon, x_target, reduction="mean")
 
-        mu_a_p, sigma_a_p = self.activity_prior(y)
-        mu_d_p, sigma_d_p = self.domain_prior(d)
+        zd_p_minus_zd_q = torch.sum(pred["pzd"].log_prob(pred["zd_q"]) - pred["qzd"].log_prob(pred["zd_q"]))
+        zy_p_minus_zy_q = torch.sum(pred["pzy"].log_prob(pred["zy_q"]) - pred["qzy"].log_prob(pred["zy_q"]))
 
-        std_a_q = torch.exp(0.5 * pred["logvar_a"])
-        std_d_q = torch.exp(0.5 * pred["logvar_d"])
+        CE_d = F.cross_entropy(pred["d_hat"], d, reduction='mean')
+        CE_y = F.cross_entropy(pred["y_hat"], y, reduction='mean')
+        
+        if self.zx_dim != 0:
+            KL_zx = torch.sum(pred["pzx"].log_prob(pred["zx_q"]) - pred["qzx"].log_prob(pred["zx_q"]))
+        else:
+            KL_zx = 0          
 
-        q_a = dist.Independent(dist.Normal(pred["mu_a"], std_a_q), 1)
-        q_d = dist.Independent(dist.Normal(pred["mu_d"], std_d_q), 1)
-
-        p_a = dist.Independent(dist.Normal(mu_a_p, sigma_a_p), 1)
-        p_d = dist.Independent(dist.Normal(mu_d_p, sigma_d_p), 1)
-
-        kl_a_neg = (p_a.log_prob(pred["z_activity"]) - q_a.log_prob(pred["z_activity"])).mean()
-        kl_d_neg = (p_d.log_prob(pred["z_domain"])   - q_d.log_prob(pred["z_domain"])).mean()
-
-        ce_y = F.cross_entropy(pred["activity_logits"], y, reduction="sum") / B
-        ce_d = F.cross_entropy(pred["domain_logits"],   d, reduction="sum") / B
-        dc_loss = aux_y * ce_y + aux_d * ce_d
-
-        elbo_loss = recon_loss - beta_kl * (kl_a_neg + kl_d_neg)
-
-        # IE (adversarial) -> GRL rein, vorzeichen bleibt "+"
-        z_d_grl = GradReverse.apply(pred["z_domain"],   1.0)  # z_domain -> predict y
-        z_y_grl = GradReverse.apply(pred["z_activity"], 1.0)  # z_activity -> predict d
-
-        logits_y_from_zd = self.activity_classifier_ie(z_d_grl)
-        logits_d_from_zy = self.domain_classifier_ie(z_y_grl)
-
-        ie_y = F.cross_entropy(logits_y_from_zd, y, reduction="sum") / B
-        ie_d = F.cross_entropy(logits_d_from_zy, d, reduction="sum") / B
-        ie_loss = ie_y + ie_d
-
-        # main objective: minimize elbo + dc, and (via GRL) remove leakage
-        total_main = elbo_loss + dc_loss #+ gamma_ie * ie_loss
-        return total_main
+        return  CE_x - self.beta_d * zd_p_minus_zd_q - self.beta_x * KL_zx - self.beta_y * zy_p_minus_zy_q + self.aux_loss_multiplier_d * CE_d + self.aux_loss_multiplier_y * CE_y,\
+               CE_y
 
 
-
-    def compute_loss_ie(
-        self,
-        y,
-        d,
-        pred,
-    ):
+    def loss_function_false(self, x, y, d):
         """
-        IE / false step (optimizer_ie):
-        train ONLY the IE heads to be good at predicting the wrong thing.
-        -> detach latents so encoders dont move in this step
+        Independent Excitation loss
+        Encourages:
+            z_d -> d
+            z_y -> y
+        Discourages:
+            z_y -> d
+            z_d -> y
         """
-        z_d = pred["z_domain"].detach()
-        z_y = pred["z_activity"].detach()
 
-        logits_y_from_zd = self.activity_classifier_ie(z_d)
-        logits_d_from_zy = self.domain_classifier_ie(z_y)
+        d = d.long()
+        y = y.long()
 
-        ie_y = F.cross_entropy(logits_y_from_zd, y, reduction="mean")
-        ie_d = F.cross_entropy(logits_d_from_zy, d, reduction="mean")
+        d_hat, y_hat, d_false, y_false = self.classify(x)
 
-        return ie_y + ie_d
+        loss_true  = self.weight_true  * (F.cross_entropy(d_hat, d, reduction="mean") + F.cross_entropy(y_hat, y, reduction="mean"))
+        loss_false = self.weight_false * (F.cross_entropy(d_false, d, reduction="mean") + F.cross_entropy(y_false, y, reduction="mean"))
+        
+        loss_false = loss_false.detach()
+        loss_false.requires_grad_(True)
+
+        return loss_true - loss_false
+    
+    @torch.no_grad()
+    def classify(self, x, grl_lambda: float = 1.0):
+        """
+        Training-safe classifier outputs.
+
+        Returns:
+            pred_d:       logits for domain from z_d         (shape: [B, d_dim])
+            pred_y:       logits for class  from z_y         (shape: [B, y_dim])
+            pred_d_false: logits for domain from z_y (cross) (shape: [B, d_dim])
+            pred_y_false: logits for class  from z_d (cross) (shape: [B, y_dim])
+
+        Notes:
+            - These are LOGITS (unnormalized scores). Use F.cross_entropy on them.
+            - Do NOT softmax/topk/one-hot here if you want gradients.
+        """
+
+        zd_mu, _, _, _ = self.domain_encoder(x)
+        zy_mu, _, _, _ = self.activity_encoder(x)
+        # true heads (no GRL)
+        y_hat = self.activity_classifier(zy_mu)
+        d_hat = self.domain_classifier(zd_mu)
+
+        # cross heads (GRL so encoder is pushed to CONFUSE, head is pushed to PREDICT)
+        zy_grl = GradReverse.apply(zy_mu, grl_lambda)
+        zd_grl = GradReverse.apply(zd_mu, grl_lambda)
+
+        d_cross = self.domain_classifier(zy_grl)     # z_y -> d (train-only, GRL)
+        y_cross = self.activity_classifier(zd_grl)   # z_d -> y (train-only, GRL)
+
+        return d_hat, y_hat, d_cross, y_cross
 
 
 def kl_divergence(logvar_q, logvar_p, mu_q, mu_p):
