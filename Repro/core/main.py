@@ -8,12 +8,12 @@ from sklearn.metrics import f1_score
 from oppor_prepro_dataloader import build_opportunity_loader
 
 # hyperparameter
-aux_loss_multiplier_y = 1000
-aux_loss_multiplier_d = 1000
-beta_d = 0.002
+aux_loss_multiplier_y = 100
+aux_loss_multiplier_d = 100
+beta_d = 1
 beta_y = 10
-weight_true = 1000
-weight_false = 1000
+weight_true = 100
+weight_false = 100
 latent_dim = 50
 
 # device
@@ -34,7 +34,7 @@ train_loaders = [
 
 test_loader = build_opportunity_loader(
     domain_ids=[TARGET_DOMAIN],  # IMPORTANT: list, not string
-    batch_size=512,
+    batch_size=4096,
     shuffle=False,
     label_type="gestures",
 )
@@ -61,22 +61,20 @@ print(device)
 main_params = (
     list(model.activity_encoder.parameters()) +
     list(model.domain_encoder.parameters()) +
-    (list(model.qzx.parameters()) if getattr(model, "zx_dim", 0) != 0 else []) +
     list(model.decoder.parameters()) +
     list(model.activity_prior.parameters()) +
-    list(model.domain_prior.parameters()) 
+    list(model.domain_prior.parameters())
 )
 
 ie_params = (
+    list(model.activity_encoder.parameters()) +
+    list(model.domain_encoder.parameters()) +
     list(model.activity_classifier.parameters()) +
     list(model.domain_classifier.parameters())
-)
 
-# optional safety check: no overlap
-assert not (set(map(id, main_params)) & set(map(id, ie_params)))
-
-opt_main = torch.optim.Adam(main_params, lr=1e-4)
-opt_ie   = torch.optim.Adam(ie_params, lr=1e-3)
+)# model.parameters()
+opt_main = torch.optim.Adam(main_params, lr=1e-4, weight_decay=1e-3)
+opt_ie   = torch.optim.Adam(ie_params, lr=1e-3, weight_decay=1e-3)
 
 def train_one_epoch(model, train_loaders, opt_main, opt_ie):
     model.train()
@@ -99,10 +97,9 @@ def train_one_epoch(model, train_loaders, opt_main, opt_ie):
             # train encoder / decoder / priors / true classifiers
             # --------------------------------------------------
             opt_main.zero_grad(set_to_none=True)
-
+            opt_ie.zero_grad(set_to_none=True)
             out = model(x, y, d)
-            loss_main, _ = model.compute_loss_main(x=x, y=y, d=d, pred=out)
-
+            loss_main = model.loss_function_elbo(x=x, y=y, d=d, pred = out)
             loss_main.backward()
             opt_main.step()
 
@@ -112,13 +109,20 @@ def train_one_epoch(model, train_loaders, opt_main, opt_ie):
             # (2) IE / FALSE STEP
             # train ONLY IE heads (i.e., only params in opt_ie)
             # --------------------------------------------------
-            opt_ie.zero_grad(set_to_none=True)
+            
 
             # Important: recompute forward path if your loss_function_false
             # depends on stochastic sampling. If it's deterministic, you can keep it.
-            loss_ie = model.loss_function_false(x, y, d)
+            out = model(x, y, d)
+            loss_dc = model.loss_function_dc(x,y,d,out)
+            loss_ie = model.loss_function_ie(x, y, d)
 
-            loss_ie.backward()
+
+
+            loss_dcie= loss_dc+loss_ie
+
+
+            loss_dcie.backward()
             opt_ie.step()
 
             total_ie += loss_ie.item() * batch_size
@@ -147,7 +151,7 @@ def evaluate(model, loaders):
 
             d_hat, y_hat, d_false, y_false = model.classify(x)
             y_pred = torch.argmax(y_hat, dim=1)
-            d_pred = torch.argmax(d_hat, dim=1)
+            d_pred = torch.argmax(d_false, dim=1)
 
             all_y_true.append(y.detach().cpu())
             all_y_pred.append(y_pred.detach().cpu())
@@ -202,11 +206,9 @@ for epoch in range(500):
             f"Act F1 (macro): {metrics_test['activity_f1_macro']:.3f} | "
             f"Act F1 (weighted): {metrics_test['activity_f1_weighted']:.3f} | "
             f"activity_accuracy: {metrics_test['activity_accuracy']:.3f} | "
-            f"domain_accuracy: {metrics_test['domain_accuracy']:.3f} | "
-            f"Domain F1 (weighted): {metrics_test['domain_f1_macro']:.3f}"
 
-
-        )
+    )
+"""        
     print(
             f"Act F1 (macro): {metrics_train['activity_f1_macro']:.3f} | "
             f"Act F1 (weighted): {metrics_train['activity_f1_weighted']:.3f} | "
@@ -214,4 +216,4 @@ for epoch in range(500):
             f"domain_accuracy: {metrics_train['domain_accuracy']:.3f} | "
             f"Domain F1 (weighted): {metrics_train['domain_f1_macro']:.3f}"
 
-    )
+    )"""

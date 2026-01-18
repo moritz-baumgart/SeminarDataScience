@@ -641,7 +641,12 @@ class GILE(nn.Module):
         }
     
   
-    def compute_loss_main(self, x, y, d, pred,):
+    def loss_function_elbo(self, x, y, d, pred):
+        d = d.long()
+        y = y.long()
+
+        #pred = self.forward(x,y,d)
+        
         B = x.size(0)
         x_recon  = pred["x_recon"].reshape(B, -1)
         x_target = x.reshape(B, -1)
@@ -650,19 +655,23 @@ class GILE(nn.Module):
         zd_p_minus_zd_q = torch.sum(pred["pzd"].log_prob(pred["zd_q"]) - pred["qzd"].log_prob(pred["zd_q"]))
         zy_p_minus_zy_q = torch.sum(pred["pzy"].log_prob(pred["zy_q"]) - pred["qzy"].log_prob(pred["zy_q"]))
 
-        CE_d = F.cross_entropy(pred["d_hat"], d, reduction='mean')
-        CE_y = F.cross_entropy(pred["y_hat"], y, reduction='mean')
+        #CE_d = F.cross_entropy(pred["d_hat"], d, reduction='mean')
+        #CE_y = F.cross_entropy(pred["y_hat"], y, reduction='mean')
         
         if self.zx_dim != 0:
             KL_zx = torch.sum(pred["pzx"].log_prob(pred["zx_q"]) - pred["qzx"].log_prob(pred["zx_q"]))
         else:
             KL_zx = 0          
+        return  CE_x - self.beta_d * zd_p_minus_zd_q - self.beta_x * KL_zx - self.beta_y * zy_p_minus_zy_q
+ 
+    
+    def loss_function_dc(self, x, y, d, pred):
+        CE_d = F.cross_entropy(pred["d_hat"], d, reduction='mean')
+        CE_y = F.cross_entropy(pred["y_hat"], y, reduction='mean')
 
-        return  CE_x - self.beta_d * zd_p_minus_zd_q - self.beta_x * KL_zx - self.beta_y * zy_p_minus_zy_q + self.aux_loss_multiplier_d * CE_d + self.aux_loss_multiplier_y * CE_y,\
-               CE_y
+        return self.aux_loss_multiplier_d * CE_d + self.aux_loss_multiplier_y * CE_y
 
-
-    def loss_function_false(self, x, y, d):
+    def loss_function_ie(self, x, y, d):
         """
         Independent Excitation loss
         Encourages:
@@ -678,44 +687,77 @@ class GILE(nn.Module):
 
         d_hat, y_hat, d_false, y_false = self.classify(x)
 
-        loss_true  = self.weight_true  * (F.cross_entropy(d_hat, d, reduction="mean") + F.cross_entropy(y_hat, y, reduction="mean"))
+        #loss_true  = self.weight_true  * (F.cross_entropy(d_hat, d, reduction="mean") + F.cross_entropy(y_hat, y, reduction="mean"))
         loss_false = self.weight_false * (F.cross_entropy(d_false, d, reduction="mean") + F.cross_entropy(y_false, y, reduction="mean"))
         
         loss_false = loss_false.detach()
         loss_false.requires_grad_(True)
 
-        return loss_true - loss_false
+
+        return  -loss_false
     
     @torch.no_grad()
-    def classify(self, x, grl_lambda: float = 1.0):
-        """
-        Training-safe classifier outputs.
+    def classify_no_inf(self,x):
+        return self.classify(x)
 
-        Returns:
-            pred_d:       logits for domain from z_d         (shape: [B, d_dim])
-            pred_y:       logits for class  from z_y         (shape: [B, y_dim])
-            pred_d_false: logits for domain from z_y (cross) (shape: [B, d_dim])
-            pred_y_false: logits for class  from z_d (cross) (shape: [B, y_dim])
+    def classify(self, x):
+            """
+            classify a batch of inputs x
+            returns:
+                d_hat    : z_d -> d (true)
+                y_hat    : z_y -> y (true)
+                d_false  : z_y -> d (false)
+                y_false  : z_d -> y (false)
+            """
+            #with torch.no_grad():
 
-        Notes:
-            - These are LOGITS (unnormalized scores). Use F.cross_entropy on them.
-            - Do NOT softmax/topk/one-hot here if you want gradients.
-        """
+            # ------------------------------
+            # encode
+            # ------------------------------
+            zy_q_loc, _, _, _ = self.activity_encoder(x)
+            zd_q_loc, _, _, _ = self.domain_encoder(x)
 
-        zd_mu, _, _, _ = self.domain_encoder(x)
-        zy_mu, _, _, _ = self.activity_encoder(x)
-        # true heads (no GRL)
-        y_hat = self.activity_classifier(zy_mu)
-        d_hat = self.domain_classifier(zd_mu)
+            zy = zy_q_loc
+            zd = zd_q_loc
 
-        # cross heads (GRL so encoder is pushed to CONFUSE, head is pushed to PREDICT)
-        zy_grl = GradReverse.apply(zy_mu, grl_lambda)
-        zd_grl = GradReverse.apply(zd_mu, grl_lambda)
+            # ------------------------------
+            # TRUE: z_d -> d
+            # ------------------------------
+            alpha_d = self.domain_classifier(zd)
+            _, ind = torch.topk(alpha_d, 1)
 
-        d_cross = self.domain_classifier(zy_grl)     # z_y -> d (train-only, GRL)
-        y_cross = self.activity_classifier(zd_grl)   # z_d -> y (train-only, GRL)
+            d_hat = x.new_zeros(alpha_d.size())
+            d_hat = d_hat.scatter_(1, ind, 1.0)
 
-        return d_hat, y_hat, d_cross, y_cross
+            # ------------------------------
+            # TRUE: z_y -> y
+            # ------------------------------
+            alpha_y = self.activity_classifier(zy)
+            _, ind = torch.topk(alpha_y, 1)
+
+            y_hat = x.new_zeros(alpha_y.size())
+            y_hat = y_hat.scatter_(1, ind, 1.0)
+
+            # ------------------------------
+            # FALSE: z_y -> d
+            # ------------------------------
+            alpha_y2d = self.domain_classifier(zy)
+            _, ind = torch.topk(alpha_y2d, 1)
+
+            d_false = x.new_zeros(alpha_y2d.size())
+            d_false = d_false.scatter_(1, ind, 1.0)
+
+            # ------------------------------
+            # FALSE: z_d -> y
+            # ------------------------------
+            alpha_d2y = self.activity_classifier(zd)
+            _, ind = torch.topk(alpha_d2y, 1)
+
+            y_false = x.new_zeros(alpha_d2y.size())
+            y_false = y_false.scatter_(1, ind, 1.0)
+
+            return d_hat, y_hat, d_false, y_false
+
 
 
 def kl_divergence(logvar_q, logvar_p, mu_q, mu_p):

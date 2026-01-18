@@ -100,7 +100,7 @@ def _windowize_opportunity(
     *,
     window_size: int,
     step_size: int,
-    drop_null: bool = True,
+    drop_null: bool = False,
     label_strategy: str = "last",   # "mode" or "last"
     flatten: bool = True,
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
