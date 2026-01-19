@@ -5,8 +5,8 @@ from utils import GradReverse
 import torch
 import torch.nn.functional as F
 from sklearn.metrics import f1_score
-from oppor_prepro_dataloader import build_opportunity_loader
-
+#from oppor_prepro_dataloader import build_opportunity_loader
+from oppor_dataloader_v2 import build_opportunity_loader
 # hyperparameter
 aux_loss_multiplier_y = 100
 aux_loss_multiplier_d = 100
@@ -28,6 +28,7 @@ train_loaders = [
         batch_size=64,
         shuffle=True,
         label_type="gestures",
+        balanced= True
     )
     for dom in SOURCE_DOMAINS
 ]
