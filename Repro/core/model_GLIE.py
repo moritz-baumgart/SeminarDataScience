@@ -623,6 +623,8 @@ class GILE(nn.Module):
         y_hat  = self.activity_classifier(zy_q)
         d_hat  = self.domain_classifier(zd_q)
 
+        y_cross  = self.activity_classifier(zd_q)
+        d_cross  = self.domain_classifier(zy_q)
 
         return {
             "x_recon": x_recon,
@@ -636,7 +638,9 @@ class GILE(nn.Module):
             "zd_q": zd_q,
             "qzy": qzy,
             "pzy": pzy,
-            "zy_q": zy_q
+            "zy_q": zy_q,
+            "y_cross":y_cross,
+            "d_cross":d_cross
 
         }
     
@@ -671,92 +675,38 @@ class GILE(nn.Module):
 
         return self.aux_loss_multiplier_d * CE_d + self.aux_loss_multiplier_y * CE_y
 
-    def loss_function_ie(self, x, y, d):
-        """
-        Independent Excitation loss
-        Encourages:
-            z_d -> d
-            z_y -> y
-        Discourages:
-            z_y -> d
-            z_d -> y
-        """
-
+    def loss_function_ie(self, x, y, d, pred):
         d = d.long()
         y = y.long()
 
-        d_hat, y_hat, d_false, y_false = self.classify(x)
+        # use logits already computed in forward (best)
+        loss_false = (
+            F.cross_entropy(pred["d_cross"], d, reduction="mean") +
+            F.cross_entropy(pred["y_cross"], y, reduction="mean")
+        )
+        return -self.weight_false * loss_false
 
-        #loss_true  = self.weight_true  * (F.cross_entropy(d_hat, d, reduction="mean") + F.cross_entropy(y_hat, y, reduction="mean"))
-        loss_false = self.weight_false * (F.cross_entropy(d_false, d, reduction="mean") + F.cross_entropy(y_false, y, reduction="mean"))
-        
-        loss_false = loss_false.detach()
-        loss_false.requires_grad_(True)
-
-
-        return  -loss_false
     
     @torch.no_grad()
     def classify_no_inf(self,x):
         return self.classify(x)
 
     def classify(self, x):
-            """
-            classify a batch of inputs x
-            returns:
-                d_hat    : z_d -> d (true)
-                y_hat    : z_y -> y (true)
-                d_false  : z_y -> d (false)
-                y_false  : z_d -> y (false)
-            """
-            #with torch.no_grad():
+        # encode
+        zy_loc, _, _, _ = self.activity_encoder(x)
+        zd_loc, _, _, _ = self.domain_encoder(x)
 
-            # ------------------------------
-            # encode
-            # ------------------------------
-            zy_q_loc, _, _, _ = self.activity_encoder(x)
-            zd_q_loc, _, _, _ = self.domain_encoder(x)
+        zy = zy_loc
+        zd = zd_loc
 
-            zy = zy_q_loc
-            zd = zd_q_loc
+        # logits (NOT one-hot)
+        d_hat   = self.domain_classifier(zd)   # z_d -> d
+        y_hat   = self.activity_classifier(zy) # z_y -> y
+        d_false = self.domain_classifier(zy)   # z_y -> d
+        y_false = self.activity_classifier(zd) # z_d -> y
 
-            # ------------------------------
-            # TRUE: z_d -> d
-            # ------------------------------
-            alpha_d = self.domain_classifier(zd)
-            _, ind = torch.topk(alpha_d, 1)
+        return d_hat, y_hat, d_false, y_false
 
-            d_hat = x.new_zeros(alpha_d.size())
-            d_hat = d_hat.scatter_(1, ind, 1.0)
-
-            # ------------------------------
-            # TRUE: z_y -> y
-            # ------------------------------
-            alpha_y = self.activity_classifier(zy)
-            _, ind = torch.topk(alpha_y, 1)
-
-            y_hat = x.new_zeros(alpha_y.size())
-            y_hat = y_hat.scatter_(1, ind, 1.0)
-
-            # ------------------------------
-            # FALSE: z_y -> d
-            # ------------------------------
-            alpha_y2d = self.domain_classifier(zy)
-            _, ind = torch.topk(alpha_y2d, 1)
-
-            d_false = x.new_zeros(alpha_y2d.size())
-            d_false = d_false.scatter_(1, ind, 1.0)
-
-            # ------------------------------
-            # FALSE: z_d -> y
-            # ------------------------------
-            alpha_d2y = self.activity_classifier(zd)
-            _, ind = torch.topk(alpha_d2y, 1)
-
-            y_false = x.new_zeros(alpha_d2y.size())
-            y_false = y_false.scatter_(1, ind, 1.0)
-
-            return d_hat, y_hat, d_false, y_false
 
 
 
