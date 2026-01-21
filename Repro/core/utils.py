@@ -1,6 +1,20 @@
 import numpy as np
 from sliding_window import sliding_window
 import torch
+
+def get_sample_weights(y, weights):
+    '''
+    to assign weights to each sample
+    '''
+    label_unique = np.unique(y)
+    sample_weights = []
+    for val in y:
+        idx = np.where(label_unique == val)
+        sample_weights.append(weights[idx])
+    return sample_weights
+
+
+
 def opp_sliding_window_w_d(
     data_x: np.ndarray,
     data_y: np.ndarray,
