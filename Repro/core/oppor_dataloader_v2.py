@@ -33,7 +33,7 @@ class data_loader_oppor(Dataset):
         y = data[0][1]
         d = data[0][2]
 
-def prep_domains_oppor(SLIDING_WINDOW_LEN=30, SLIDING_WINDOW_STEP=15, batch_size = 64, target_domain = 'S1'):
+def prep_domains_oppor(SLIDING_WINDOW_LEN=30, SLIDING_WINDOW_STEP=15, batch_size = 64, target_domain = 'S4'):
     """
     Build dataloaders from already preprocessed domain files stored in a
     dedicated directory.

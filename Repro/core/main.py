@@ -1,12 +1,10 @@
-from torch.utils.data import DataLoader
-#from oppor_dataloader import build_opportunity_loader
-from model_GLIE import kl_divergence, GILE
-from utils import GradReverse
+from model_GLIE import GILE
 import torch
 import torch.nn.functional as F
 from sklearn.metrics import f1_score
-from oppor_prepro_dataloader import build_opportunity_loader
 from oppor_dataloader_v2 import prep_domains_oppor
+from ucihar_dataloader import prep_domains_ucihar_preprocessed
+from shar_dataloader import prep_domains_shar_preprocessed
 # hyperparameter
 beta_kl = 0.1    # KL-Regularisierung
 alpha_cls = 1.0    # Klassifikations-Loss

@@ -116,10 +116,10 @@ class QZD(nn.Module):
     Domain-specific latent encoder
     """
 
-    def __init__(self, d_dim, x_dim, y_dim, zd_dim, zx_dim, zy_dim):
+    def __init__(self, d_dim, x_dim, y_dim, zd_dim, zx_dim, zy_dim,input_dim):
         super().__init__()
 
-        self.n_features = 77
+        self.n_features = input_dim
 
         # Convolutional backbone 
         self.conv1 = nn.Conv2d(self.n_features, 1024, kernel_size=(1, 5))
@@ -193,9 +193,9 @@ class QZY(nn.Module):
     Activity-specific latent encoder
     """
 
-    def __init__(self, d_dim, x_dim, y_dim, zd_dim, zx_dim, zy_dim):
+    def __init__(self, d_dim, x_dim, y_dim, zd_dim, zx_dim, zy_dim,input_dim):
         super().__init__()
-        self.n_features = 77
+        self.n_features = input_dim
 
         # Convolutional backbone 
         self.conv1 = nn.Conv2d(self.n_features, 1024, kernel_size=(1, 5))
@@ -269,10 +269,10 @@ class PX(nn.Module):
     Decoder using unpooling + transposed convolutions.
     """
 
-    def __init__(self, d_dim, x_dim, y_dim, zd_dim, zx_dim, zy_dim):
+    def __init__(self, d_dim, x_dim, y_dim, zd_dim, zx_dim, zy_dim, input_dim):
         super().__init__()
 
-        self.n_features = 77
+        self.n_features = input_dim
 
         total_latent_dim = zd_dim + zx_dim + zy_dim
 
@@ -411,15 +411,15 @@ class GILE(nn.Module):
         self.x_dim = 0
         self.y_dim = 18 #class
         # Encoders
-        self.activity_encoder = QZY(self.d_dim, self.x_dim, self.y_dim, self.zd_dim, self.zx_dim, self.zy_dim) #qzy
-        self.domain_encoder = QZD(self.d_dim, self.x_dim, self.y_dim, self.zd_dim, self.zx_dim, self.zy_dim) # qzd
+        self.activity_encoder = QZY(self.d_dim, self.x_dim, self.y_dim, self.zd_dim, self.zx_dim, self.zy_dim,input_dim) #qzy
+        self.domain_encoder = QZD(self.d_dim, self.x_dim, self.y_dim, self.zd_dim, self.zx_dim, self.zy_dim,input_dim) # qzd
 
         # Priors
         self.activity_prior = ClassPrior(self.d_dim, self.x_dim, self.y_dim, self.zd_dim, self.zx_dim, self.zy_dim) #pzy
         self.domain_prior = DomainPrior(self.d_dim, self.x_dim, self.y_dim, self.zd_dim, self.zx_dim, self.zy_dim) #pzd
 
         # Decoder
-        self.decoder = PX(self.d_dim, self.x_dim, self.y_dim, self.zd_dim, self.zx_dim, self.zy_dim) #
+        self.decoder = PX(self.d_dim, self.x_dim, self.y_dim, self.zd_dim, self.zx_dim, self.zy_dim, input_dim) #px
 
         # Disentangling classifiers
         self.activity_classifier = QY(self.d_dim, self.x_dim, self.y_dim, self.zd_dim, self.zx_dim, self.zy_dim) # qy
