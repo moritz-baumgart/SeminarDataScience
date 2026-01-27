@@ -1,14 +1,12 @@
 from pathlib import Path
-from typing import Optional
 
 import h5py
-from matplotlib.axes import Axes
-from matplotlib.collections import QuadMesh
-from matplotlib.colorbar import Colorbar
 import numpy as np
 import pandas as pd
+import seaborn as sns
 from h5py import Dataset
 from matplotlib import pyplot as plt
+from matplotlib.axes import Axes
 from scipy.signal import spectrogram
 
 DATA_DIR = Path("./data")
@@ -54,8 +52,35 @@ def two_example_spectograms():
     plt.savefig(OUT_DIR / "hd_epic_ex_specto.png", dpi=600, bbox_inches="tight")
 
 
-def main():
+def repro_boxplots():
+    df = pd.read_csv("./data/repro.csv")
 
+    df = df.rename(
+        columns={"Paper Score": "Original", "Reproduction Score": "Reproduction"}
+    )
+
+    diff = (df["Original"] - df["Reproduction"]).abs()
+
+    print(f"{diff.min()=}, {diff.max()=}, {diff.mean()=}")
+
+    df_melt = df.melt(
+        id_vars="dataset",
+        value_vars=["Original", "Reproduction"],
+        var_name="metric",
+        value_name="value",
+    )
+
+    sns.boxplot(x="dataset", y="value", hue="metric", data=df_melt)
+    plt.title("F1-Score (%) by Dataset (Averaged over LOO Evaluation)")
+    plt.legend(title="", loc="lower left")
+    plt.xlabel("Dataset")
+    plt.ylabel("F1-Score (%)")
+
+    plt.tight_layout()
+    plt.savefig(OUT_DIR / "repro_boxplots.png", dpi=600)
+
+
+def main():
     # annotations = pd.read_csv("./data/HD_EPIC_Sounds.csv")
     # print(annotations["class"].unique())
     # annotations = annotations[annotations["video_id"] == "P01-20240202-110250"]
@@ -67,6 +92,7 @@ def main():
     OUT_DIR.mkdir(exist_ok=True, parents=True)
 
     two_example_spectograms()
+    repro_boxplots()
 
 
 if __name__ == "__main__":
