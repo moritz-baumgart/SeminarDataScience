@@ -4,10 +4,9 @@ import os
 import numpy as np
 import torch
 from torch.utils.data import Dataset, DataLoader
-
+from sliding_window import sliding_window
 from utils import get_sample_weights
-
-SHAR_DATA_DIR = "./data/shar_preprocessed"  # adjust to your folder
+SHAR_DATA_DIR = "./data/shar_preprocessed" 
 
 
 class data_loader_shar(Dataset):
@@ -26,7 +25,7 @@ class data_loader_shar(Dataset):
 
 def prep_domains_shar_preprocessed(
     batch_size: int = 64,
-    target_domain: str = "1",
+    target_domain: str = "5",
     data_dir: str = SHAR_DATA_DIR,
 ):
     """

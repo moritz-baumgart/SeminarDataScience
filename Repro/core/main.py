@@ -3,7 +3,7 @@ import torch
 import torch.nn.functional as F
 from sklearn.metrics import f1_score
 from oppor_dataloader_v2 import prep_domains_oppor
-from ucihar_dataloader import prep_domains_ucihar_preprocessed
+#from ucihar_dataloader import prep_domains_ucihar_preprocessed
 from shar_dataloader import prep_domains_shar_preprocessed
 # hyperparameter
 beta_kl = 0.1    # KL-Regularisierung
@@ -167,7 +167,7 @@ def get_accuracy(source_loaders, DEVICE, model, classifier_fn, batch_size):
         # activity macro F1
         y_true = torch.cat(actuals_y).cpu().numpy()
         y_pred = torch.cat([p.argmax(1) for p in predictions_y]).cpu().numpy()
-        y_macro_f1 = f1_score(y_true, y_pred, average="macro")
+        y_macro_f1 = f1_score(y_true, y_pred, average="weighted")
 
         return accuracy_d, accuracy_y, accuracy_d_false, accuracy_y_false, d_macro_f1, y_macro_f1
 
