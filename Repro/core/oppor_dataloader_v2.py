@@ -27,7 +27,7 @@ class data_loader_oppor(Dataset):
         :param domain_idx:
         :return: X and y data of the entire domain
         """
-        saved_filename = 'oppor_domain_' + domain_idx + '_wd.data' # with domain label
+        saved_filename = 'oppor_domain_' + domain_idx + '_wd.data' 
         data = np.load(DATA_DIR + saved_filename, allow_pickle=True)
         X = data[0][0]
         y = data[0][1]

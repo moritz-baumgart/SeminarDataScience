@@ -7,9 +7,7 @@ import torch.distributions as dist
 from typing import Optional, List
 
 
-# ---------------------------
 # Decoder: p(x | z_d, z_x, z_y)  (SHAR-specific: 640 -> (64,1,10), kernel (1,4))
-# ---------------------------
 class PX(nn.Module):
     def __init__(self, n_feature: int, zd_dim: int, zx_dim: int, zy_dim: int):
         super().__init__()
@@ -67,9 +65,7 @@ class PX(nn.Module):
         return out_44.permute(0, 2, 3, 1)
 
 
-# ---------------------------
 # Priors: p(z_d|d), p(z_y|y)
-# ---------------------------
 class DomainPrior(nn.Module):
     def __init__(self, d_dim: int, zd_dim: int, device: torch.device):
         super().__init__()
@@ -122,10 +118,8 @@ class ClassPrior(nn.Module):
         return mu, scale
 
 
-# ---------------------------
 # Encoders: q(z_d|x), q(z_y|x)  (SHAR-specific conv kernel (1,4), flatten=640)
 # expects x shape (B, T, F) and reshapes to (B, F, 1, T)
-# ---------------------------
 class QZD(nn.Module):
     def __init__(self, n_feature: int, zd_dim: int):
         super().__init__()
@@ -234,9 +228,7 @@ class QZY(nn.Module):
         return mu, scale, [idx1, idx2, idx3, idx4], [size1, size2, size3, size4]
 
 
-# ---------------------------
 # Aux heads: q(d|z_d), q(y|z_y)
-# ---------------------------
 class QD(nn.Module):
     def __init__(self, zd_dim: int, d_dim: int):
         super().__init__()
@@ -259,9 +251,7 @@ class QY(nn.Module):
         return self.fc1(F.relu(zy))
 
 
-# ---------------------------
 # Main model: GILE(self-config) (NO argparse/args Namespace)
-# ---------------------------
 class GILE(nn.Module):
     """
     SHAR GILE variant:
@@ -412,7 +402,6 @@ class GILE(nn.Module):
         return loss
 
     def classifier(self, x):
-        # Author-style: no_grad + one-hot scatter
         with torch.no_grad():
             # d from zd
             zd_q_loc, _, _, _ = self.qzd(x)

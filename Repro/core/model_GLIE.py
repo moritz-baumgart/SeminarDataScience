@@ -431,8 +431,8 @@ class GILE(nn.Module):
 
     def forward(self, x, y, d):
         x = torch.unsqueeze(x, 1)
-        d = d.long().view(-1)   # or d = d.squeeze(-1)
-        y = y.long().view(-1)   # or y = y.squeeze(-1)
+        d = d.long().view(-1)   
+        y = y.long().view(-1) 
 
         #encode
         mu_y, sigma_y, pool_idx_y, pool_sizes_y = self.activity_encoder(x)

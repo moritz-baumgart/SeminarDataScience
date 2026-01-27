@@ -19,26 +19,7 @@ device = "cuda" if torch.cuda.is_available() else "cpu"
 SOURCE_DOMAINS = ["S1", "S2", "S3"]
 TARGET_DOMAIN  = "S4"
 
-"""train_loaders = [
-    build_opportunity_loader(
-        domain_ids=[dom],      # IMPORTANT: list, not string
-        batch_size=64,
-        shuffle=True,
-        #expected_x_dim=30*77,
-        label_type="gestures",
-        #balanced= True
-    )
-    for dom in SOURCE_DOMAINS
-]
 
-test_loader = build_opportunity_loader(
-    domain_ids=[TARGET_DOMAIN],  # IMPORTANT: list, not string
-    batch_size=4096,
-    #expected_x_dim=30*77,
-    shuffle=False,
-    label_type="gestures",
-)
-"""
 train_loaders, test_loader = prep_domains_oppor()
 # model
 model = GILE(
@@ -157,6 +138,7 @@ def get_accuracy(source_loaders, DEVICE, model, classifier_fn, batch_size):
             _, num_pred = pred.max(1)
             v = torch.sum(num_pred == act)
             accurate_preds_y_false += v
+            
         # calculate the accuracy between 0 and 1
         accuracy_y_false = (accurate_preds_y_false * 1.0) / (len(predictions_y_false) * batch_size)
           # domain macro F1

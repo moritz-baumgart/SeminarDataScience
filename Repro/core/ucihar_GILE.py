@@ -7,9 +7,7 @@ import torch.distributions as dist
 from typing import Optional, Tuple, List
 
 
-# ---------------------------
 # Decoder: p(x | z_d, z_x, z_y)
-# ---------------------------
 class PX(nn.Module):
     def __init__(self, d_dim, x_dim, y_dim, zd_dim, zx_dim, zy_dim, args):
         super().__init__()
@@ -45,7 +43,6 @@ class PX(nn.Module):
             nn.ReLU(),
         )
 
-        # init like author
         nn.init.xavier_uniform_(self.fc1[0].weight)
         nn.init.xavier_uniform_(self.deconv1[0].weight)
         nn.init.xavier_uniform_(self.deconv2[0].weight)
@@ -73,14 +70,11 @@ class PX(nn.Module):
         out_4 = self.un4(out_33, idxs[0])
         out_44 = self.deconv4(out_4)
 
-        # EXACT author permute
         out = out_44.permute(0, 3, 1, 2)
         return out
 
 
-# ---------------------------
 # Priors: p(z_d | d), p(z_y | y)
-# ---------------------------
 class DomainPrior(nn.Module):
     def __init__(self, d_dim, x_dim, y_dim, zd_dim, zx_dim, zy_dim, args):
         super().__init__()
@@ -131,9 +125,7 @@ class ClassPrior(nn.Module):
         return mu, scale
 
 
-# ---------------------------
 # Encoders: q(z_d|x), q(z_y|x)
-# ---------------------------
 class QZD(nn.Module):
     def __init__(self, d_dim, x_dim, y_dim, zd_dim, zx_dim, zy_dim, args):
         super().__init__()
@@ -165,7 +157,6 @@ class QZD(nn.Module):
         self.fc12[0].bias.data.zero_()
 
     def forward(self, x: torch.Tensor):
-        # Author expects x shape (B, T, F)
         x = x.float()
         x_img = x.view(-1, x.shape[2], 1, x.shape[1])  # (B, F, 1, T)
 
@@ -224,7 +215,6 @@ class QZY(nn.Module):
         self.fc12[0].bias.data.zero_()
 
     def forward(self, x: torch.Tensor):
-        # Author expects x shape (B, T, F)
         x = x.float()
         x_img = x.view(-1, x.shape[2], 1, x.shape[1])  # (B, F, 1, T)
 
@@ -252,9 +242,7 @@ class QZY(nn.Module):
         return mu, scale, [idx1, idx2, idx3, idx4], [size1, size2, size3, size4]
 
 
-# ---------------------------
 # Auxiliary heads: q(d|z_d), q(y|z_y)
-# ---------------------------
 class QD(nn.Module):
     def __init__(self, d_dim, x_dim, y_dim, zd_dim, zx_dim, zy_dim):
         super().__init__()
@@ -279,9 +267,7 @@ class QY(nn.Module):
         return self.fc1(h)
 
 
-# ---------------------------
 # Main model: GILE(args)
-# ---------------------------
 class GILE(nn.Module):
     def __init__(self, args):
         super().__init__()
@@ -310,7 +296,6 @@ class GILE(nn.Module):
         self.beta_x = args.beta_x
         self.beta_y = args.beta_y
 
-        # author does .cuda(); we instead follow args.device robustly
         self.to(args.device)
 
     def forward(self, d, x, y):
@@ -339,7 +324,6 @@ class GILE(nn.Module):
         d_hat = self.qd(zd_q)
         y_hat = self.qy(zy_q)
 
-        # Keep the exact tuple layout expected by author loss
         qzx = None
         pzx = None
         zx_q = None
@@ -351,7 +335,7 @@ class GILE(nn.Module):
         CE_x = F.mse_loss(x_recon, x.float())
 
         zd_p_minus_zd_q = torch.sum(pzd.log_prob(zd_q) - qzd.log_prob(zd_q))
-        KL_zx = 0  # zx disabled in both author + your adaptation
+        KL_zx = 0 
         zy_p_minus_zy_q = torch.sum(pzy.log_prob(zy_q) - qzy.log_prob(zy_q))
 
         CE_d = F.cross_entropy(d_hat, d, reduction="sum")
@@ -369,7 +353,6 @@ class GILE(nn.Module):
         return total, CE_y
 
     def loss_function_false(self, args, d, x, y):
-        # identical call + math as author
         pred_d, pred_y, pred_d_false, pred_y_false = self.classifier(x)
 
         loss_classify_true = args.weight_true * (
@@ -384,7 +367,6 @@ class GILE(nn.Module):
         return loss
 
     def classifier(self, x):
-        # EXACT author behavior (uses no_grad + one-hot scatter)
         with torch.no_grad():
             zd_q_loc, _, _, _ = self.qzd(x)
             zd = zd_q_loc
@@ -422,7 +404,7 @@ def make_gile_args_for_dataset(
     n_domains: int,      # #domains
     device: torch.device,
     d_AE: int = 50,
-    x_dim: int = 1152,   # keep author default unless your code uses it elsewhere
+    x_dim: int = 1152,   
     aux_loss_multiplier_y: float = 1000.0,
     aux_loss_multiplier_d: float = 1000.0,
     beta_d: float = 1.0,

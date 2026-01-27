@@ -2,41 +2,35 @@ from argparse import Namespace
 import torch
 from sklearn.metrics import f1_score
 
-# from your model file (the spec-faithful one)
-from ucihar_GILE import GILE  # this should contain the GILE(args) version
+
+from ucihar_GILE import GILE
 
 from oppor_dataloader_v2 import prep_domains_oppor
 from ucihar_dataloader import prep_domains_ucihar
 from shar_dataloader import prep_domains_shar_preprocessed
 
 
-# -----------------------
 # device
-# -----------------------
 DEVICE = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 print("Device:", DEVICE)
 
 
-# -----------------------
-# dataloaders (example)
-# IMPORTANT: loaders must yield x as (B, T, F) and y,d as label indices (B,)
-# -----------------------
+# dataloaders 
 train_loaders, test_loader = prep_domains_ucihar()
 
 
-# -----------------------
 # build args for spec-faithful model
-# NOTE: set these to your dataset properties
-# -----------------------
+
+
 args = Namespace(
     device=DEVICE,
 
     # dataset structure
-    n_feature=9,     # F (UCihar)
-    n_class=6,       # #activities
-    n_domains=5,     # #domains
+    n_feature=9,    
+    n_class=6,       
+    n_domains=5,     
 
-    # model hyperparams (author defaults)
+    # model hyperparams 
     d_AE=50,         # latent dim for z_d and z_y
     x_dim=1152,      # kept for compatibility
 
@@ -47,30 +41,22 @@ args = Namespace(
     beta_x=0.0,
     beta_y=1.0,
 
-    # IE/false-step weights (used by loss_function_false)
+    # IE/false-step weights 
     weight_true=1000.0,
     weight_false=1000.0,
 )
 
 
-# -----------------------
 # model
-# -----------------------
 model = GILE(args).to(DEVICE)
 
 
-# -----------------------
 # optimizers
-# Author trains main + IE in separate steps; to match your pattern, use two optimizers.
-# If you want strict author behavior, keep both on all params (as you already do).
-# -----------------------
 optimizer = torch.optim.Adam(model.parameters(), lr=1e-3, weight_decay=1e-3)
 false_optimizer = torch.optim.Adam(model.parameters(), lr=1e-3, weight_decay=1e-3)
 
 
-# -----------------------
 # training
-# -----------------------
 def train_one_epoch(source_loaders):
     model.train()
     train_loss_sum = 0.0
@@ -83,13 +69,11 @@ def train_one_epoch(source_loaders):
             y = y.to(DEVICE).long().view(-1)
             d = d.to(DEVICE).long().view(-1)
 
-            # ----- main step -----
             optimizer.zero_grad(set_to_none=True)
             loss_origin, ce_y = model.loss_function(d, x, y)
             loss_origin.backward()
             optimizer.step()
 
-            # ----- IE/false step -----
             false_optimizer.zero_grad(set_to_none=True)
             loss_false = model.loss_function_false(args, d, x, y)
             loss_false.backward()
@@ -98,21 +82,16 @@ def train_one_epoch(source_loaders):
             bs = y.size(0)
             total += bs
 
-            # loss_origin and ce_y are tensors; accumulate as floats
             train_loss_sum += float(loss_origin.detach().cpu())
             class_y_loss_sum += float(ce_y.detach().cpu())
 
-    # report per-sample averages (your old code did /total)
     avg_loss = train_loss_sum / max(total, 1)
     avg_ce_y = class_y_loss_sum / max(total, 1)
     return avg_loss, avg_ce_y
 
 
-# -----------------------
 # evaluation
 # classifier returns one-hot predictions (author style)
-# so we convert: pred = onehot.argmax(1)
-# -----------------------
 @torch.no_grad()
 def get_accuracy(loaders, device, model, classifier_fn, batch_size):
     model.eval()
@@ -163,9 +142,7 @@ def get_accuracy(loaders, device, model, classifier_fn, batch_size):
     return acc_d, acc_y, acc_d_false, acc_y_false, d_macro_f1, y_macro_f1
 
 
-# -----------------------
 # run training
-# -----------------------
 torch.manual_seed(10)
 
 for epoch in range(150):

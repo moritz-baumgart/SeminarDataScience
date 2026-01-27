@@ -1,23 +1,10 @@
-# shar_main.py (NO argparse) — works with the self-config GILE model
-#
-# expects:
-#   - from model_GLIE import GILE   (the self-config version you asked for)
-#   - from shar_dataloader import prep_domains_shar_preprocessed
-# loader yields:
-#   x: (B, T, F)  (e.g., (B,151,3))
-#   y: (B,) int labels
-#   d: (B,) int labels
-
 import torch
 from sklearn.metrics import f1_score
-
 from shar_GILE import GILE
 from shar_dataloader import prep_domains_shar_preprocessed
 
 
-# -----------------------
-# hyperparams (keep simple like your older scripts)
-# -----------------------
+# hyperparams 
 SEED = 10
 BATCH_SIZE = 64
 N_EPOCH = 100
@@ -29,12 +16,9 @@ N_FEATURE = 3
 N_CLASS = 17
 N_DOMAINS = 6
 D_AE = 50
-LEN_SW = 151  # not used by model, but useful for sanity checks
+LEN_SW = 151 
 
 
-# -----------------------
-# device
-# -----------------------
 DEVICE = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 print("Device:", DEVICE)
 
@@ -124,16 +108,11 @@ def main():
     torch.manual_seed(SEED)
 
     # dataloaders
-    # NOTE: if your prep_domains_shar_preprocessed() does not accept batch_size,
-    # remove the arg and ensure it internally uses BATCH_SIZE.
     train_loaders, test_loader = prep_domains_shar_preprocessed(batch_size=BATCH_SIZE)
 
-    # optional sanity check (one batch)
     x0, y0, d0 = next(iter(train_loaders[0]))
     print("Sanity batch shapes:", x0.shape, y0.shape, d0.shape)
-    # expected: (B, 151, 3) (B,) (B,)
 
-    # model (self-config, no args namespace)
     model = GILE(
         n_feature=N_FEATURE,
         n_class=N_CLASS,

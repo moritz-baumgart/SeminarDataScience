@@ -1,4 +1,3 @@
-# encoding=utf-8
 import os
 import numpy as np
 from torch.utils.data import Dataset, DataLoader
@@ -11,7 +10,6 @@ import pickle as cp
 from sklearn.model_selection import StratifiedShuffleSplit
 
 
-# This is for parsing the X data, you can ignore it if you do not need preprocessing
 def format_data_x(datafile):
     x_data = None
     for item in datafile:
