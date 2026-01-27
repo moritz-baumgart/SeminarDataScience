@@ -1,0 +1,5 @@
+
+# Ignore large HD Epic files:
+HD_EPIC_Sounds.csv
+P01_audio.hdf5
+P02_audio.hdf5
