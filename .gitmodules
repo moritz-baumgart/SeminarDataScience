@@ -1,0 +1,3 @@
+[submodule "Repro/core"]
+	path = Repro/core
+	url = https://github.com/Hangwei12358/cross-person-HAR.git

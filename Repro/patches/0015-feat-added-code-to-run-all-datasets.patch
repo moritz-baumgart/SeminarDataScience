@@ -1,0 +1,1624 @@
+From 5120b16384f37c7c35d23c6ce6800fd721ab6096 Mon Sep 17 00:00:00 2001
+From: sinan-pourazari <sinan.pourazari@gmx.de>
+Date: Tue, 27 Jan 2026 19:31:40 +0100
+Subject: [PATCH 15/16] feat: added code to run all datasets
+
+---
+ main.py              |   4 +-
+ main_ucihar.py       | 225 +++++++++++++++++-----
+ shar_GILE.py         | 446 ++++++++++++++++++++++++++++++++++++++++++
+ shar_dataloader.py   |   7 +-
+ shar_main.py         | 180 +++++++++++++++++
+ ucihar_GILE.py       | 448 +++++++++++++++++++++++++++++++++++++++++++
+ ucihar_dataloader.py | 194 +++++++++++--------
+ 7 files changed, 1378 insertions(+), 126 deletions(-)
+ create mode 100644 shar_GILE.py
+ create mode 100644 shar_main.py
+ create mode 100644 ucihar_GILE.py
+
+diff --git a/main.py b/main.py
+index 2573916..2613d2b 100644
+--- a/main.py
++++ b/main.py
+@@ -3,7 +3,7 @@ import torch
+ import torch.nn.functional as F
+ from sklearn.metrics import f1_score
+ from oppor_dataloader_v2 import prep_domains_oppor
+-from ucihar_dataloader import prep_domains_ucihar_preprocessed
++#from ucihar_dataloader import prep_domains_ucihar_preprocessed
+ from shar_dataloader import prep_domains_shar_preprocessed
+ # hyperparameter
+ beta_kl = 0.1    # KL-Regularisierung
+@@ -167,7 +167,7 @@ def get_accuracy(source_loaders, DEVICE, model, classifier_fn, batch_size):
+         # activity macro F1
+         y_true = torch.cat(actuals_y).cpu().numpy()
+         y_pred = torch.cat([p.argmax(1) for p in predictions_y]).cpu().numpy()
+-        y_macro_f1 = f1_score(y_true, y_pred, average="macro")
++        y_macro_f1 = f1_score(y_true, y_pred, average="weighted")
+ 
+         return accuracy_d, accuracy_y, accuracy_d_false, accuracy_y_false, d_macro_f1, y_macro_f1
+ 
+diff --git a/main_ucihar.py b/main_ucihar.py
+index cfa4849..23871d5 100644
+--- a/main_ucihar.py
++++ b/main_ucihar.py
+@@ -1,56 +1,193 @@
+-# encoding=utf-8
+-import matplotlib
+-matplotlib.use('Agg')
+-
+-from train import train
+-from utils import set_name
+-import network_ucihar as net
+-import data_preprocess_ucihar
++from argparse import Namespace
+ import torch
+-import argparse
++from sklearn.metrics import f1_score
+ 
+-DEVICE = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
+-parser = argparse.ArgumentParser(description='argument setting of network')
+-parser.add_argument('--now_model_name', type=str, default='GILE', help='the type of model')
++# from your model file (the spec-faithful one)
++from ucihar_GILE import GILE  # this should contain the GILE(args) version
+ 
+-parser.add_argument('--batch_size', type=int, default=64, help='batch size of training')
+-parser.add_argument('--n_epoch', type=int, default=150, help='number of training epochs')
+-parser.add_argument('--dataset', type=str, default='ucihar', help='name of dataset')
++from oppor_dataloader_v2 import prep_domains_oppor
++from ucihar_dataloader import prep_domains_ucihar
++from shar_dataloader import prep_domains_shar_preprocessed
+ 
+-parser.add_argument('--n_feature', type=int, default=9, help='name of feature dimension')
+-parser.add_argument('--len_sw', type=int, default=128, help='length of sliding window')
+-parser.add_argument('--n_class', type=int, default=6, help='number of class')
+-parser.add_argument('--d_AE', type=int, default=50, help='dim of AE')
+-parser.add_argument('--sigma', type=float, default=1, help='parameter of mmd')
+-parser.add_argument('--weight_mmd', type=float, default=1.0, help='weight of mmd loss')
+ 
+-parser.add_argument('--target_domain', type=str, default='0', help='the target domain, [0 to 4]')
+-parser.add_argument('--test_every', type=int, default=1, help='do testing every n epochs')
+-parser.add_argument('-n_domains', type=int, default=5, help='number of total domains actually')
+-parser.add_argument('-n_target_domains', type=int, default=1, help='number of target domains')
++# -----------------------
++# device
++# -----------------------
++DEVICE = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
++print("Device:", DEVICE)
+ 
+-parser.add_argument('--beta', type=float, default=1., help='multiplier for KL')
+ 
+-parser.add_argument('--x-dim', type=int, default=1152, help='input size after flattening')
+-parser.add_argument('--aux_loss_multiplier_y', type=float, default=1000., help='multiplier for y classifier')
+-parser.add_argument('--aux_loss_multiplier_d', type=float, default=1000., help='multiplier for d classifier')
++# -----------------------
++# dataloaders (example)
++# IMPORTANT: loaders must yield x as (B, T, F) and y,d as label indices (B,)
++# -----------------------
++train_loaders, test_loader = prep_domains_ucihar()
+ 
+-parser.add_argument('--beta_d', type=float, default=1., help='multiplier for KL d')
+-parser.add_argument('--beta_x', type=float, default=0., help='multiplier for KL x')
+-parser.add_argument('--beta_y', type=float, default=1., help='multiplier for KL y')
+ 
+-parser.add_argument('--weight_true', type=float, default=1000.0, help='weights for classifier true')
+-parser.add_argument('--weight_false', type=float, default=1000.0, help='weights for classifier false')
++# -----------------------
++# build args for spec-faithful model
++# NOTE: set these to your dataset properties
++# -----------------------
++args = Namespace(
++    device=DEVICE,
+ 
+-if __name__ == '__main__':
+-    torch.manual_seed(10)
+-    args = parser.parse_args()
+-    args.device = DEVICE
+-    source_loaders, target_loader = data_preprocess_ucihar.prep_domains_ucihar(args, SLIDING_WINDOW_LEN=args.len_sw, SLIDING_WINDOW_STEP=int(0.5*args.len_sw))
+-    model = net.load_model(args)
+-    model = model.to(DEVICE)
+-    optimizer = net.set_up_optimizers(model.parameters())
+-    result_csv, result_txt, dir_name = set_name(args)
+-    train(model, DEVICE, optimizer, source_loaders, target_loader, result_csv, result_txt, args)
++    # dataset structure
++    n_feature=9,     # F (UCihar)
++    n_class=6,       # #activities
++    n_domains=5,     # #domains
+ 
++    # model hyperparams (author defaults)
++    d_AE=50,         # latent dim for z_d and z_y
++    x_dim=1152,      # kept for compatibility
+ 
++    # loss weights
++    aux_loss_multiplier_y=1000.0,
++    aux_loss_multiplier_d=1000.0,
++    beta_d=1.0,
++    beta_x=0.0,
++    beta_y=1.0,
++
++    # IE/false-step weights (used by loss_function_false)
++    weight_true=1000.0,
++    weight_false=1000.0,
++)
++
++
++# -----------------------
++# model
++# -----------------------
++model = GILE(args).to(DEVICE)
++
++
++# -----------------------
++# optimizers
++# Author trains main + IE in separate steps; to match your pattern, use two optimizers.
++# If you want strict author behavior, keep both on all params (as you already do).
++# -----------------------
++optimizer = torch.optim.Adam(model.parameters(), lr=1e-3, weight_decay=1e-3)
++false_optimizer = torch.optim.Adam(model.parameters(), lr=1e-3, weight_decay=1e-3)
++
++
++# -----------------------
++# training
++# -----------------------
++def train_one_epoch(source_loaders):
++    model.train()
++    train_loss_sum = 0.0
++    class_y_loss_sum = 0.0
++    total = 0
++
++    for source_loader in source_loaders:
++        for x, y, d in source_loader:
++            x = x.to(DEVICE)
++            y = y.to(DEVICE).long().view(-1)
++            d = d.to(DEVICE).long().view(-1)
++
++            # ----- main step -----
++            optimizer.zero_grad(set_to_none=True)
++            loss_origin, ce_y = model.loss_function(d, x, y)
++            loss_origin.backward()
++            optimizer.step()
++
++            # ----- IE/false step -----
++            false_optimizer.zero_grad(set_to_none=True)
++            loss_false = model.loss_function_false(args, d, x, y)
++            loss_false.backward()
++            false_optimizer.step()
++
++            bs = y.size(0)
++            total += bs
++
++            # loss_origin and ce_y are tensors; accumulate as floats
++            train_loss_sum += float(loss_origin.detach().cpu())
++            class_y_loss_sum += float(ce_y.detach().cpu())
++
++    # report per-sample averages (your old code did /total)
++    avg_loss = train_loss_sum / max(total, 1)
++    avg_ce_y = class_y_loss_sum / max(total, 1)
++    return avg_loss, avg_ce_y
++
++
++# -----------------------
++# evaluation
++# classifier returns one-hot predictions (author style)
++# so we convert: pred = onehot.argmax(1)
++# -----------------------
++@torch.no_grad()
++def get_accuracy(loaders, device, model, classifier_fn, batch_size):
++    model.eval()
++
++    pred_d_list, true_d_list = [], []
++    pred_y_list, true_y_list = [], []
++    pred_d_false_list, pred_y_false_list = [], []
++
++    for loader in loaders:
++        for xs, ys, ds in loader:
++            xs = xs.to(device)
++            ys = ys.to(device).long().view(-1)
++            ds = ds.to(device).long().view(-1)
++
++            d_onehot, y_onehot, d_false_onehot, y_false_onehot = classifier_fn(xs)
++
++            # convert one-hot -> label indices
++            d_pred = d_onehot.argmax(1)
++            y_pred = y_onehot.argmax(1)
++            d_false_pred = d_false_onehot.argmax(1)
++            y_false_pred = y_false_onehot.argmax(1)
++
++            pred_d_list.append(d_pred)
++            pred_y_list.append(y_pred)
++            pred_d_false_list.append(d_false_pred)
++            pred_y_false_list.append(y_false_pred)
++
++            true_d_list.append(ds)
++            true_y_list.append(ys)
++
++    d_true = torch.cat(true_d_list)
++    y_true = torch.cat(true_y_list)
++    d_pred = torch.cat(pred_d_list)
++    y_pred = torch.cat(pred_y_list)
++    d_false_pred = torch.cat(pred_d_false_list)
++    y_false_pred = torch.cat(pred_y_false_list)
++
++    # accuracies
++    acc_d = (d_pred == d_true).float().mean().item()
++    acc_y = (y_pred == y_true).float().mean().item()
++    acc_d_false = (d_false_pred == d_true).float().mean().item()
++    acc_y_false = (y_false_pred == y_true).float().mean().item()
++
++    # macro F1
++    d_macro_f1 = f1_score(d_true.cpu().numpy(), d_pred.cpu().numpy(), average="macro")
++    y_macro_f1 = f1_score(y_true.cpu().numpy(), y_pred.cpu().numpy(), average="macro")
++
++    return acc_d, acc_y, acc_d_false, acc_y_false, d_macro_f1, y_macro_f1
++
++
++# -----------------------
++# run training
++# -----------------------
++torch.manual_seed(10)
++
++for epoch in range(150):
++    avg_epoch_loss, avg_epoch_ce_y = train_one_epoch(train_loaders)
++
++    train_acc_d, train_acc_y, train_acc_d_false, train_acc_y_false, _, _ = get_accuracy(
++        train_loaders, DEVICE, model, model.classifier, batch_size=64
++    )
++
++    test_acc_d, test_acc_y, test_acc_d_false, test_acc_y_false, _, y_macro_f1 = get_accuracy(
++        [test_loader], DEVICE, model, model.classifier, batch_size=64
++    )
++
++    print(
++        f"Epoch {epoch:03d} | "
++        f"Loss main: {avg_epoch_loss:8.4f} | "
++        f"CE_y: {avg_epoch_ce_y:8.4f} | "
++        f"Train ActAcc: {train_acc_y:5.3f} | "
++        f"Train DomAcc: {train_acc_d:5.3f} | "
++        f"Train FalseAct: {train_acc_y_false:5.3f} | "
++        f"Train FalseDom: {train_acc_d_false:5.3f} | "
++        f"Test ActAcc: {test_acc_y:5.3f} | "
++        f"Test DomAcc: {test_acc_d:5.3f} | "
++        f"Test F1 MacroAct: {y_macro_f1:5.3f}"
++    )
+diff --git a/shar_GILE.py b/shar_GILE.py
+new file mode 100644
+index 0000000..7cf5408
+--- /dev/null
++++ b/shar_GILE.py
+@@ -0,0 +1,446 @@
++from __future__ import annotations
++
++import torch
++import torch.nn as nn
++import torch.nn.functional as F
++import torch.distributions as dist
++from typing import Optional, List
++
++
++# ---------------------------
++# Decoder: p(x | z_d, z_x, z_y)  (SHAR-specific: 640 -> (64,1,10), kernel (1,4))
++# ---------------------------
++class PX(nn.Module):
++    def __init__(self, n_feature: int, zd_dim: int, zx_dim: int, zy_dim: int):
++        super().__init__()
++        self.n_feature = n_feature
++
++        self.fc1 = nn.Sequential(
++            nn.Linear(zd_dim + zx_dim + zy_dim, 640, bias=False),
++            nn.BatchNorm1d(640),
++            nn.ReLU(),
++        )
++
++        self.un1 = nn.MaxUnpool2d(kernel_size=(1, 2), stride=2)
++        self.deconv1 = nn.Sequential(nn.ConvTranspose2d(64, 128, kernel_size=(1, 1)), nn.ReLU())
++
++        self.un2 = nn.MaxUnpool2d(kernel_size=(1, 2), stride=2)
++        self.deconv2 = nn.Sequential(nn.ConvTranspose2d(128, 512, kernel_size=(1, 1)), nn.ReLU())
++
++        self.un3 = nn.MaxUnpool2d(kernel_size=(1, 2), stride=2)
++        self.deconv3 = nn.Sequential(nn.ConvTranspose2d(512, 1024, kernel_size=(1, 1)), nn.ReLU())
++
++        self.un4 = nn.MaxUnpool2d(kernel_size=(1, 2), stride=2)
++        self.deconv4 = nn.Sequential(
++            nn.ConvTranspose2d(1024, self.n_feature, kernel_size=(1, 4)),
++            nn.ReLU(),
++        )
++
++        nn.init.xavier_uniform_(self.fc1[0].weight)
++        nn.init.xavier_uniform_(self.deconv1[0].weight)
++        nn.init.xavier_uniform_(self.deconv2[0].weight)
++        nn.init.xavier_uniform_(self.deconv3[0].weight)
++        nn.init.xavier_uniform_(self.deconv4[0].weight)
++
++    def forward(self, zd, zx, zy, idxs, sizes):
++        if zx is None:
++            z = torch.cat((zd, zy), dim=-1)
++        else:
++            z = torch.cat((zd, zx, zy), dim=-1)
++
++        h = self.fc1(z)
++        h = h.view(-1, 64, 1, 10)  # SHAR-specific
++
++        out_1 = self.un1(h, idxs[3], output_size=sizes[2])
++        out_11 = self.deconv1(out_1)
++
++        out_2 = self.un2(out_11, idxs[2], output_size=sizes[1])
++        out_22 = self.deconv2(out_2)
++
++        out_3 = self.un3(out_22, idxs[1], output_size=sizes[0])
++        out_33 = self.deconv3(out_3)
++
++        out_4 = self.un4(out_33, idxs[0])
++        out_44 = self.deconv4(out_4)
++
++        # output layout: (B, 1, T, F)
++        return out_44.permute(0, 2, 3, 1)
++
++
++# ---------------------------
++# Priors: p(z_d|d), p(z_y|y)
++# ---------------------------
++class DomainPrior(nn.Module):
++    def __init__(self, d_dim: int, zd_dim: int, device: torch.device):
++        super().__init__()
++        self.d_dim = d_dim
++        self.device = device
++
++        self.fc1 = nn.Sequential(nn.Linear(d_dim, zd_dim, bias=False), nn.BatchNorm1d(zd_dim), nn.ReLU())
++        self.fc21 = nn.Linear(zd_dim, zd_dim)
++        self.fc22 = nn.Sequential(nn.Linear(zd_dim, zd_dim), nn.Softplus())
++
++        nn.init.xavier_uniform_(self.fc1[0].weight)
++        nn.init.xavier_uniform_(self.fc21.weight)
++        nn.init.zeros_(self.fc21.bias)
++        nn.init.xavier_uniform_(self.fc22[0].weight)
++        nn.init.zeros_(self.fc22[0].bias)
++
++    def forward(self, d: torch.LongTensor):
++        d = d.long().view(-1)
++        d_onehot = F.one_hot(d, num_classes=self.d_dim).float().to(self.device)
++
++        hidden = self.fc1(d_onehot)
++        mu = self.fc21(hidden)
++        scale = self.fc22(hidden) + 1e-7
++        return mu, scale
++
++
++class ClassPrior(nn.Module):
++    def __init__(self, y_dim: int, zy_dim: int, device: torch.device):
++        super().__init__()
++        self.y_dim = y_dim
++        self.device = device
++
++        self.fc1 = nn.Sequential(nn.Linear(y_dim, zy_dim, bias=False), nn.BatchNorm1d(zy_dim), nn.ReLU())
++        self.fc21 = nn.Linear(zy_dim, zy_dim)
++        self.fc22 = nn.Sequential(nn.Linear(zy_dim, zy_dim), nn.Softplus())
++
++        nn.init.xavier_uniform_(self.fc1[0].weight)
++        nn.init.xavier_uniform_(self.fc21.weight)
++        nn.init.zeros_(self.fc21.bias)
++        nn.init.xavier_uniform_(self.fc22[0].weight)
++        nn.init.zeros_(self.fc22[0].bias)
++
++    def forward(self, y: torch.LongTensor):
++        y = y.long().view(-1)
++        y_onehot = F.one_hot(y, num_classes=self.y_dim).float().to(self.device)
++
++        hidden = self.fc1(y_onehot)
++        mu = self.fc21(hidden)
++        scale = self.fc22(hidden) + 1e-7
++        return mu, scale
++
++
++# ---------------------------
++# Encoders: q(z_d|x), q(z_y|x)  (SHAR-specific conv kernel (1,4), flatten=640)
++# expects x shape (B, T, F) and reshapes to (B, F, 1, T)
++# ---------------------------
++class QZD(nn.Module):
++    def __init__(self, n_feature: int, zd_dim: int):
++        super().__init__()
++        self.n_feature = n_feature
++
++        self.conv1 = nn.Sequential(nn.Conv2d(self.n_feature, 1024, kernel_size=(1, 4)), nn.ReLU())
++        self.pool1 = nn.MaxPool2d((1, 2), stride=2, return_indices=True, ceil_mode=True)
++
++        self.conv2 = nn.Sequential(nn.Conv2d(1024, 512, kernel_size=(1, 1)), nn.ReLU())
++        self.pool2 = nn.MaxPool2d((1, 2), stride=2, return_indices=True, ceil_mode=True)
++
++        self.conv3 = nn.Sequential(nn.Conv2d(512, 128, kernel_size=(1, 1)), nn.ReLU())
++        self.pool3 = nn.MaxPool2d((1, 2), stride=2, return_indices=True, ceil_mode=True)
++
++        self.conv4 = nn.Sequential(nn.Conv2d(128, 64, kernel_size=(1, 1)), nn.ReLU())
++        self.pool4 = nn.MaxPool2d((1, 2), stride=2, return_indices=True, ceil_mode=True)
++
++        self.fc11 = nn.Linear(640, zd_dim)
++        self.fc12 = nn.Sequential(nn.Linear(640, zd_dim), nn.Softplus())
++
++        nn.init.xavier_uniform_(self.conv1[0].weight)
++        nn.init.xavier_uniform_(self.conv2[0].weight)
++        nn.init.xavier_uniform_(self.conv3[0].weight)
++        nn.init.xavier_uniform_(self.conv4[0].weight)
++
++        nn.init.xavier_uniform_(self.fc11.weight)
++        nn.init.zeros_(self.fc11.bias)
++        nn.init.xavier_uniform_(self.fc12[0].weight)
++        nn.init.zeros_(self.fc12[0].bias)
++
++    def forward(self, x: torch.Tensor):
++        # x: (B, T, F) -> (B, F, 1, T)
++        x_img = x.float().view(-1, x.shape[2], 1, x.shape[1])
++
++        out_conv1 = self.conv1(x_img)
++        out1, idx1 = self.pool1(out_conv1)
++
++        out_conv2 = self.conv2(out1)
++        out2, idx2 = self.pool2(out_conv2)
++
++        out_conv3 = self.conv3(out2)
++        out3, idx3 = self.pool3(out_conv3)
++
++        out_conv4 = self.conv4(out3)
++        out4, idx4 = self.pool4(out_conv4)
++
++        out = out4.reshape(-1, out4.shape[1] * out4.shape[3])  # 64*10=640
++        size1, size2, size3, size4 = out1.size(), out2.size(), out3.size(), out4.size()
++
++        mu = self.fc11(out)
++        scale = self.fc12(out) + 1e-7
++        return mu, scale, [idx1, idx2, idx3, idx4], [size1, size2, size3, size4]
++
++
++class QZY(nn.Module):
++    def __init__(self, n_feature: int, zy_dim: int):
++        super().__init__()
++        self.n_feature = n_feature
++
++        self.conv1 = nn.Sequential(nn.Conv2d(self.n_feature, 1024, kernel_size=(1, 4)), nn.ReLU())
++        self.pool1 = nn.MaxPool2d((1, 2), stride=2, return_indices=True, ceil_mode=True)
++
++        self.conv2 = nn.Sequential(nn.Conv2d(1024, 512, kernel_size=(1, 1)), nn.ReLU())
++        self.pool2 = nn.MaxPool2d((1, 2), stride=2, return_indices=True, ceil_mode=True)
++
++        self.conv3 = nn.Sequential(nn.Conv2d(512, 128, kernel_size=(1, 1)), nn.ReLU())
++        self.pool3 = nn.MaxPool2d((1, 2), stride=2, return_indices=True, ceil_mode=True)
++
++        self.conv4 = nn.Sequential(nn.Conv2d(128, 64, kernel_size=(1, 1)), nn.ReLU())
++        self.pool4 = nn.MaxPool2d((1, 2), stride=2, return_indices=True, ceil_mode=True)
++
++        self.fc11 = nn.Linear(640, zy_dim)
++        self.fc12 = nn.Sequential(nn.Linear(640, zy_dim), nn.Softplus())
++
++        nn.init.xavier_uniform_(self.conv1[0].weight)
++        nn.init.xavier_uniform_(self.conv2[0].weight)
++        nn.init.xavier_uniform_(self.conv3[0].weight)
++        nn.init.xavier_uniform_(self.conv4[0].weight)
++
++        nn.init.xavier_uniform_(self.fc11.weight)
++        nn.init.zeros_(self.fc11.bias)
++        nn.init.xavier_uniform_(self.fc12[0].weight)
++        nn.init.zeros_(self.fc12[0].bias)
++
++    def forward(self, x: torch.Tensor):
++        # x: (B, T, F) -> (B, F, 1, T)
++        x_img = x.float().view(-1, x.shape[2], 1, x.shape[1])
++
++        out_conv1 = self.conv1(x_img)
++        out1, idx1 = self.pool1(out_conv1)
++
++        out_conv2 = self.conv2(out1)
++        out2, idx2 = self.pool2(out_conv2)
++
++        out_conv3 = self.conv3(out2)
++        out3, idx3 = self.pool3(out_conv3)
++
++        out_conv4 = self.conv4(out3)
++        out4, idx4 = self.pool4(out_conv4)
++
++        out = out4.reshape(-1, out4.shape[1] * out4.shape[3])  # 640
++        size1, size2, size3, size4 = out1.size(), out2.size(), out3.size(), out4.size()
++
++        mu = self.fc11(out)
++        scale = self.fc12(out) + 1e-7
++        return mu, scale, [idx1, idx2, idx3, idx4], [size1, size2, size3, size4]
++
++
++# ---------------------------
++# Aux heads: q(d|z_d), q(y|z_y)
++# ---------------------------
++class QD(nn.Module):
++    def __init__(self, zd_dim: int, d_dim: int):
++        super().__init__()
++        self.fc1 = nn.Linear(zd_dim, d_dim)
++        nn.init.xavier_uniform_(self.fc1.weight)
++        nn.init.zeros_(self.fc1.bias)
++
++    def forward(self, zd):
++        return self.fc1(F.relu(zd))
++
++
++class QY(nn.Module):
++    def __init__(self, zy_dim: int, y_dim: int):
++        super().__init__()
++        self.fc1 = nn.Linear(zy_dim, y_dim)
++        nn.init.xavier_uniform_(self.fc1.weight)
++        nn.init.zeros_(self.fc1.bias)
++
++    def forward(self, zy):
++        return self.fc1(F.relu(zy))
++
++
++# ---------------------------
++# Main model: GILE(self-config) (NO argparse/args Namespace)
++# ---------------------------
++class GILE(nn.Module):
++    """
++    SHAR GILE variant:
++      - x input shape: (B, T, F)  (e.g., (B,151,3))
++      - reconstruction shape: (B, 1, T, F)
++      - conv kernel: (1,4)
++      - flatten: 640
++      - decoder seed: view(-1,64,1,10)
++
++    You configure everything via __init__ params (like your older code style).
++    """
++
++    def __init__(
++        self,
++        n_feature: int = 3,          # F
++        n_class: int = 17,           # activities
++        n_domains: int = 6,          # domains
++        d_AE: int = 50,              # latent dim for z_d and z_y
++        x_dim: int = 1152,           # kept for compatibility (not used by conv)
++        aux_loss_multiplier_y: float = 1000.0,
++        aux_loss_multiplier_d: float = 1000.0,
++        beta_d: float = 1.0,
++        beta_x: float = 1.0,
++        beta_y: float = 1.0,
++        weight_true: float = 1000.0,
++        weight_false: float = 1000.0,
++        device: Optional[torch.device] = None,
++    ):
++        super().__init__()
++
++        self.device = device if device is not None else torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
++
++        # dims
++        self.n_feature = n_feature
++        self.y_dim = n_class
++        self.d_dim = n_domains
++        self.zd_dim = d_AE
++        self.zy_dim = d_AE
++        self.zx_dim = 0
++        self.x_dim = x_dim
++
++        # weights
++        self.aux_loss_multiplier_y = aux_loss_multiplier_y
++        self.aux_loss_multiplier_d = aux_loss_multiplier_d
++        self.beta_d = beta_d
++        self.beta_x = beta_x
++        self.beta_y = beta_y
++        self.weight_true = weight_true
++        self.weight_false = weight_false
++
++        # modules
++        self.px = PX(self.n_feature, self.zd_dim, self.zx_dim, self.zy_dim)
++        self.pzd = DomainPrior(self.d_dim, self.zd_dim, self.device)
++        self.pzy = ClassPrior(self.y_dim, self.zy_dim, self.device)
++
++        self.qzd = QZD(self.n_feature, self.zd_dim)
++        self.qzy = QZY(self.n_feature, self.zy_dim)
++
++        self.qd = QD(self.zd_dim, self.d_dim)
++        self.qy = QY(self.zy_dim, self.y_dim)
++
++        # move to device
++        self.to(self.device)
++
++    def forward(self, d, x, y):
++        # x expected: (B, T, F)
++        d = d.long().view(-1)
++        y = y.long().view(-1)
++
++        # Encode
++        zd_q_loc, zd_q_scale, _, _ = self.qzd(x)
++        zy_q_loc, zy_q_scale, idxs_y, sizes_y = self.qzy(x)
++
++        # Reparam
++        qzd = dist.Normal(zd_q_loc, zd_q_scale)
++        zd_q = qzd.rsample()
++
++        qzy = dist.Normal(zy_q_loc, zy_q_scale)
++        zy_q = qzy.rsample()
++
++        # Decode -> (B, 1, T, F)
++        x_recon = self.px(zd_q, None, zy_q, idxs_y, sizes_y)
++
++        # Priors
++        zd_p_loc, zd_p_scale = self.pzd(d)
++        zy_p_loc, zy_p_scale = self.pzy(y)
++        pzd = dist.Normal(zd_p_loc, zd_p_scale)
++        pzy = dist.Normal(zy_p_loc, zy_p_scale)
++
++        # Aux logits
++        d_hat = self.qd(zd_q)
++        y_hat = self.qy(zy_q)
++
++        qzx = None
++        pzx = None
++        zx_q = None
++        return x_recon, d_hat, y_hat, qzd, pzd, zd_q, qzx, pzx, zx_q, qzy, pzy, zy_q
++
++    def loss_function(self, d, x, y):
++        d = d.long().view(-1)
++        y = y.long().view(-1)
++
++        x_recon, d_hat, y_hat, qzd, pzd, zd_q, qzx, pzx, zx_q, qzy, pzy, zy_q = self.forward(d, x, y)
++
++        # compare against (B,1,T,F)
++        x_target = x.unsqueeze(1)
++
++        CE_x = F.mse_loss(x_recon, x_target.float())
++
++        # author-style "p - q" term using log_probs of sampled z
++        zd_p_minus_zd_q = torch.sum(pzd.log_prob(zd_q) - qzd.log_prob(zd_q))
++        zy_p_minus_zy_q = torch.sum(pzy.log_prob(zy_q) - qzy.log_prob(zy_q))
++
++        KL_zx = 0  # no z_x in this variant
++
++        CE_d = F.cross_entropy(d_hat, d, reduction="sum")
++        CE_y = F.cross_entropy(y_hat, y, reduction="sum")
++
++        total = (
++            CE_x
++            - self.beta_d * zd_p_minus_zd_q
++            - self.beta_x * KL_zx
++            - self.beta_y * zy_p_minus_zy_q
++            + self.aux_loss_multiplier_d * CE_d
++            + self.aux_loss_multiplier_y * CE_y
++        )
++        return total, CE_y
++
++    def loss_function_false(self, d, x, y):
++        """
++        IE / false step (author-style):
++        note: classifier() is non-differentiable (no_grad + topk/scatter), matches author behavior.
++        """
++        d = d.long().view(-1)
++        y = y.long().view(-1)
++
++        pred_d, pred_y, pred_d_false, pred_y_false = self.classifier(x)
++
++        loss_classify_true = self.weight_true * (
++            F.cross_entropy(pred_d, d, reduction="sum") + F.cross_entropy(pred_y, y, reduction="sum")
++        )
++        loss_classify_false = self.weight_false * (
++            F.cross_entropy(pred_d_false, d, reduction="sum") + F.cross_entropy(pred_y_false, y, reduction="sum")
++        )
++
++        loss = loss_classify_true - loss_classify_false
++        loss.requires_grad = True
++        return loss
++
++    def classifier(self, x):
++        # Author-style: no_grad + one-hot scatter
++        with torch.no_grad():
++            # d from zd
++            zd_q_loc, _, _, _ = self.qzd(x)
++            zd = zd_q_loc
++            alpha_d = F.softmax(self.qd(zd), dim=1)
++            _, ind = torch.topk(alpha_d, 1)
++            d = x.new_zeros(alpha_d.size()).scatter_(1, ind, 1.0)
++
++            # y from zy
++            zy_q_loc, _, _, _ = self.qzy(x)
++            zy = zy_q_loc
++            alpha_y = F.softmax(self.qy(zy), dim=1)
++            _, ind = torch.topk(alpha_y, 1)
++            y = x.new_zeros(alpha_y.size()).scatter_(1, ind, 1.0)
++
++            # false: d from zy
++            alpha_y2d = F.softmax(self.qd(zy), dim=1)
++            _, ind = torch.topk(alpha_y2d, 1)
++            d_false = x.new_zeros(alpha_y2d.size()).scatter_(1, ind, 1.0)
++
++            # false: y from zd
++            alpha_d2y = F.softmax(self.qy(zd), dim=1)
++            _, ind = torch.topk(alpha_d2y, 1)
++            y_false = x.new_zeros(alpha_d2y.size()).scatter_(1, ind, 1.0)
++
++        return d, y, d_false, y_false
++
++    def get_features(self, x):
++        zy_q_loc, zy_q_scale, _, _ = self.qzy(x)
++        qzy = dist.Normal(zy_q_loc, zy_q_scale)
++        return qzy.rsample()
+diff --git a/shar_dataloader.py b/shar_dataloader.py
+index ae8b990..08d039e 100644
+--- a/shar_dataloader.py
++++ b/shar_dataloader.py
+@@ -4,10 +4,9 @@ import os
+ import numpy as np
+ import torch
+ from torch.utils.data import Dataset, DataLoader
+-
++from sliding_window import sliding_window
+ from utils import get_sample_weights
+-
+-SHAR_DATA_DIR = "./data/shar_preprocessed"  # adjust to your folder
++SHAR_DATA_DIR = "./data/shar_preprocessed" 
+ 
+ 
+ class data_loader_shar(Dataset):
+@@ -26,7 +25,7 @@ class data_loader_shar(Dataset):
+ 
+ def prep_domains_shar_preprocessed(
+     batch_size: int = 64,
+-    target_domain: str = "1",
++    target_domain: str = "5",
+     data_dir: str = SHAR_DATA_DIR,
+ ):
+     """
+diff --git a/shar_main.py b/shar_main.py
+new file mode 100644
+index 0000000..47a457b
+--- /dev/null
++++ b/shar_main.py
+@@ -0,0 +1,180 @@
++# shar_main.py (NO argparse) — works with the self-config GILE model
++#
++# expects:
++#   - from model_GLIE import GILE   (the self-config version you asked for)
++#   - from shar_dataloader import prep_domains_shar_preprocessed
++# loader yields:
++#   x: (B, T, F)  (e.g., (B,151,3))
++#   y: (B,) int labels
++#   d: (B,) int labels
++
++import torch
++from sklearn.metrics import f1_score
++
++from shar_GILE import GILE
++from shar_dataloader import prep_domains_shar_preprocessed
++
++
++# -----------------------
++# hyperparams (keep simple like your older scripts)
++# -----------------------
++SEED = 10
++BATCH_SIZE = 64
++N_EPOCH = 100
++LR = 1e-3
++WEIGHT_DECAY = 1e-3
++
++# SHAR specs
++N_FEATURE = 3
++N_CLASS = 17
++N_DOMAINS = 6
++D_AE = 50
++LEN_SW = 151  # not used by model, but useful for sanity checks
++
++
++# -----------------------
++# device
++# -----------------------
++DEVICE = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
++print("Device:", DEVICE)
++
++
++def train_one_epoch(model, source_loaders, optimizer, false_optimizer):
++    model.train()
++    loss_sum = 0.0
++    ce_y_sum = 0.0
++    total = 0
++
++    for loader in source_loaders:
++        for x, y, d in loader:
++            x = x.to(DEVICE)
++            y = y.to(DEVICE).long().view(-1)
++            d = d.to(DEVICE).long().view(-1)
++
++            # ---- main step ----
++            optimizer.zero_grad(set_to_none=True)
++            loss_main, ce_y = model.loss_function(d, x, y)
++            loss_main.backward()
++            optimizer.step()
++
++            # ---- false / IE step ----
++            false_optimizer.zero_grad(set_to_none=True)
++            loss_false = model.loss_function_false(d, x, y)
++            loss_false.backward()
++            false_optimizer.step()
++
++            bs = y.size(0)
++            total += bs
++            loss_sum += float(loss_main.detach().cpu())
++            ce_y_sum += float(ce_y.detach().cpu())
++
++    return loss_sum / max(total, 1), ce_y_sum / max(total, 1)
++
++
++@torch.no_grad()
++def get_accuracy(loaders, model, classifier_fn):
++    model.eval()
++
++    d_true_all, d_pred_all = [], []
++    y_true_all, y_pred_all = [], []
++    d_false_all, y_false_all = [], []
++
++    for loader in loaders:
++        for xs, ys, ds in loader:
++            xs = xs.to(DEVICE)
++            ys = ys.to(DEVICE).long().view(-1)
++            ds = ds.to(DEVICE).long().view(-1)
++
++            # classifier returns one-hot (author-style)
++            d_oh, y_oh, d_false_oh, y_false_oh = classifier_fn(xs)
++
++            d_pred = d_oh.argmax(1)
++            y_pred = y_oh.argmax(1)
++            d_false_pred = d_false_oh.argmax(1)
++            y_false_pred = y_false_oh.argmax(1)
++
++            d_true_all.append(ds)
++            y_true_all.append(ys)
++
++            d_pred_all.append(d_pred)
++            y_pred_all.append(y_pred)
++
++            d_false_all.append(d_false_pred)
++            y_false_all.append(y_false_pred)
++
++    d_true = torch.cat(d_true_all)
++    y_true = torch.cat(y_true_all)
++    d_pred = torch.cat(d_pred_all)
++    y_pred = torch.cat(y_pred_all)
++    d_false_pred = torch.cat(d_false_all)
++    y_false_pred = torch.cat(y_false_all)
++
++    acc_d = (d_pred == d_true).float().mean().item()
++    acc_y = (y_pred == y_true).float().mean().item()
++    acc_d_false = (d_false_pred == d_true).float().mean().item()
++    acc_y_false = (y_false_pred == y_true).float().mean().item()
++
++    d_macro_f1 = f1_score(d_true.cpu().numpy(), d_pred.cpu().numpy(), average="macro")
++    y_weighted_f1 = f1_score(y_true.cpu().numpy(), y_pred.cpu().numpy(), average="weighted")
++
++    return acc_d, acc_y, acc_d_false, acc_y_false, d_macro_f1, y_weighted_f1
++
++
++def main():
++    torch.manual_seed(SEED)
++
++    # dataloaders
++    # NOTE: if your prep_domains_shar_preprocessed() does not accept batch_size,
++    # remove the arg and ensure it internally uses BATCH_SIZE.
++    train_loaders, test_loader = prep_domains_shar_preprocessed(batch_size=BATCH_SIZE)
++
++    # optional sanity check (one batch)
++    x0, y0, d0 = next(iter(train_loaders[0]))
++    print("Sanity batch shapes:", x0.shape, y0.shape, d0.shape)
++    # expected: (B, 151, 3) (B,) (B,)
++
++    # model (self-config, no args namespace)
++    model = GILE(
++        n_feature=N_FEATURE,
++        n_class=N_CLASS,
++        n_domains=N_DOMAINS,
++        d_AE=D_AE,
++        beta_d=1.0,
++        beta_x=1.0,
++        beta_y=1.0,
++        aux_loss_multiplier_y=1000.0,
++        aux_loss_multiplier_d=1000.0,
++        weight_true=1000.0,
++        weight_false=1000.0,
++        device=DEVICE,
++    ).to(DEVICE)
++
++    optimizer = torch.optim.Adam(model.parameters(), lr=LR, weight_decay=WEIGHT_DECAY)
++    false_optimizer = torch.optim.Adam(model.parameters(), lr=LR, weight_decay=WEIGHT_DECAY)
++
++    for epoch in range(N_EPOCH):
++        avg_epoch_loss, avg_epoch_ce_y = train_one_epoch(model, train_loaders, optimizer, false_optimizer)
++
++        train_acc_d, train_acc_y, train_acc_d_false, train_acc_y_false, _, _ = get_accuracy(
++            train_loaders, model, model.classifier
++        )
++        test_acc_d, test_acc_y, test_acc_d_false, test_acc_y_false, _, y_weighted_f1 = get_accuracy(
++            [test_loader], model, model.classifier
++        )
++
++        print(
++            f"Epoch {epoch:03d} | "
++            f"Loss main: {avg_epoch_loss:8.4f} | "
++            f"CE_y: {avg_epoch_ce_y:8.4f} | "
++            f"Train ActAcc: {train_acc_y:5.3f} | "
++            f"Train DomAcc: {train_acc_d:5.3f} | "
++            f"Train FalseAct: {train_acc_y_false:5.3f} | "
++            f"Train FalseDom: {train_acc_d_false:5.3f} | "
++            f"Test ActAcc: {test_acc_y:5.3f} | "
++            f"Test DomAcc: {test_acc_d:5.3f} | "
++            f"Test F1 WeightedAct: {y_weighted_f1:5.3f}"
++        )
++
++
++if __name__ == "__main__":
++    main()
+diff --git a/ucihar_GILE.py b/ucihar_GILE.py
+new file mode 100644
+index 0000000..1be4310
+--- /dev/null
++++ b/ucihar_GILE.py
+@@ -0,0 +1,448 @@
++from __future__ import annotations
++
++import torch
++import torch.nn as nn
++import torch.nn.functional as F
++import torch.distributions as dist
++from typing import Optional, Tuple, List
++
++
++# ---------------------------
++# Decoder: p(x | z_d, z_x, z_y)
++# ---------------------------
++class PX(nn.Module):
++    def __init__(self, d_dim, x_dim, y_dim, zd_dim, zx_dim, zy_dim, args):
++        super().__init__()
++        self.n_feature = args.n_feature
++
++        self.fc1 = nn.Sequential(
++            nn.Linear(zd_dim + zx_dim + zy_dim, 512, bias=False),
++            nn.BatchNorm1d(512),
++            nn.ReLU(),
++        )
++
++        self.un1 = nn.MaxUnpool2d(kernel_size=(1, 2), stride=2)
++        self.deconv1 = nn.Sequential(
++            nn.ConvTranspose2d(in_channels=64, out_channels=128, kernel_size=(1, 1)),
++            nn.ReLU(),
++        )
++
++        self.un2 = nn.MaxUnpool2d(kernel_size=(1, 2), stride=2)
++        self.deconv2 = nn.Sequential(
++            nn.ConvTranspose2d(in_channels=128, out_channels=512, kernel_size=(1, 1)),
++            nn.ReLU(),
++        )
++
++        self.un3 = nn.MaxUnpool2d(kernel_size=(1, 2), stride=2)
++        self.deconv3 = nn.Sequential(
++            nn.ConvTranspose2d(in_channels=512, out_channels=1024, kernel_size=(1, 1)),
++            nn.ReLU(),
++        )
++
++        self.un4 = nn.MaxUnpool2d(kernel_size=(1, 2), stride=2)
++        self.deconv4 = nn.Sequential(
++            nn.ConvTranspose2d(in_channels=1024, out_channels=self.n_feature, kernel_size=(1, 5)),
++            nn.ReLU(),
++        )
++
++        # init like author
++        nn.init.xavier_uniform_(self.fc1[0].weight)
++        nn.init.xavier_uniform_(self.deconv1[0].weight)
++        nn.init.xavier_uniform_(self.deconv2[0].weight)
++        nn.init.xavier_uniform_(self.deconv3[0].weight)
++        nn.init.xavier_uniform_(self.deconv4[0].weight)
++
++    def forward(self, zd, zx, zy, idxs, sizes):
++        if zx is None:
++            z = torch.cat((zd, zy), dim=-1)
++        else:
++            z = torch.cat((zd, zx, zy), dim=-1)
++
++        h = self.fc1(z)
++        h = h.view(-1, 64, 1, 8)
++
++        out_1 = self.un1(h, idxs[3], output_size=sizes[2])
++        out_11 = self.deconv1(out_1)
++
++        out_2 = self.un2(out_11, idxs[2], output_size=sizes[1])
++        out_22 = self.deconv2(out_2)
++
++        out_3 = self.un3(out_22, idxs[1], output_size=sizes[0])
++        out_33 = self.deconv3(out_3)
++
++        out_4 = self.un4(out_33, idxs[0])
++        out_44 = self.deconv4(out_4)
++
++        # EXACT author permute
++        out = out_44.permute(0, 3, 1, 2)
++        return out
++
++
++# ---------------------------
++# Priors: p(z_d | d), p(z_y | y)
++# ---------------------------
++class DomainPrior(nn.Module):
++    def __init__(self, d_dim, x_dim, y_dim, zd_dim, zx_dim, zy_dim, args):
++        super().__init__()
++        self.d_dim = d_dim
++        self.device = args.device
++
++        self.fc1 = nn.Sequential(nn.Linear(d_dim, zd_dim, bias=False), nn.BatchNorm1d(zd_dim), nn.ReLU())
++        self.fc21 = nn.Sequential(nn.Linear(zd_dim, zd_dim))
++        self.fc22 = nn.Sequential(nn.Linear(zd_dim, zd_dim), nn.Softplus())
++
++        nn.init.xavier_uniform_(self.fc1[0].weight)
++        nn.init.xavier_uniform_(self.fc21[0].weight)
++        self.fc21[0].bias.data.zero_()
++        nn.init.xavier_uniform_(self.fc22[0].weight)
++        self.fc22[0].bias.data.zero_()
++
++    def forward(self, d: torch.LongTensor) -> Tuple[torch.Tensor, torch.Tensor]:
++        a = torch.eye(self.d_dim, device=self.device)
++        d_onehot = a[d]
++        hidden = self.fc1(d_onehot)
++        mu = self.fc21(hidden)
++        scale = self.fc22(hidden) + 1e-7
++        return mu, scale
++
++
++class ClassPrior(nn.Module):
++    def __init__(self, d_dim, x_dim, y_dim, zd_dim, zx_dim, zy_dim, args):
++        super().__init__()
++        self.y_dim = y_dim
++        self.device = args.device
++
++        self.fc1 = nn.Sequential(nn.Linear(y_dim, zy_dim, bias=False), nn.BatchNorm1d(zy_dim), nn.ReLU())
++        self.fc21 = nn.Sequential(nn.Linear(zy_dim, zy_dim))
++        self.fc22 = nn.Sequential(nn.Linear(zy_dim, zy_dim), nn.Softplus())
++
++        nn.init.xavier_uniform_(self.fc1[0].weight)
++        nn.init.xavier_uniform_(self.fc21[0].weight)
++        self.fc21[0].bias.data.zero_()
++        nn.init.xavier_uniform_(self.fc22[0].weight)
++        self.fc22[0].bias.data.zero_()
++
++    def forward(self, y: torch.LongTensor) -> Tuple[torch.Tensor, torch.Tensor]:
++        a = torch.eye(self.y_dim, device=self.device)
++        y_onehot = a[y]
++        hidden = self.fc1(y_onehot)
++        mu = self.fc21(hidden)
++        scale = self.fc22(hidden) + 1e-7
++        return mu, scale
++
++
++# ---------------------------
++# Encoders: q(z_d|x), q(z_y|x)
++# ---------------------------
++class QZD(nn.Module):
++    def __init__(self, d_dim, x_dim, y_dim, zd_dim, zx_dim, zy_dim, args):
++        super().__init__()
++        self.n_feature = args.n_feature
++
++        self.conv1 = nn.Sequential(nn.Conv2d(self.n_feature, 1024, kernel_size=(1, 5)), nn.ReLU())
++        self.pool1 = nn.MaxPool2d(kernel_size=(1, 2), stride=2, return_indices=True, ceil_mode=True)
++
++        self.conv2 = nn.Sequential(nn.Conv2d(1024, 512, kernel_size=(1, 1)), nn.ReLU())
++        self.pool2 = nn.MaxPool2d(kernel_size=(1, 2), stride=2, return_indices=True, ceil_mode=True)
++
++        self.conv3 = nn.Sequential(nn.Conv2d(512, 128, kernel_size=(1, 1)), nn.ReLU())
++        self.pool3 = nn.MaxPool2d(kernel_size=(1, 2), stride=2, return_indices=True, ceil_mode=True)
++
++        self.conv4 = nn.Sequential(nn.Conv2d(128, 64, kernel_size=(1, 1)), nn.ReLU())
++        self.pool4 = nn.MaxPool2d(kernel_size=(1, 2), stride=2, return_indices=True, ceil_mode=True)
++
++        self.fc11 = nn.Sequential(nn.Linear(512, zd_dim))
++        self.fc12 = nn.Sequential(nn.Linear(512, zd_dim), nn.Softplus())
++
++        nn.init.xavier_uniform_(self.conv1[0].weight)
++        nn.init.xavier_uniform_(self.conv2[0].weight)
++        nn.init.xavier_uniform_(self.conv3[0].weight)
++        nn.init.xavier_uniform_(self.conv4[0].weight)
++
++        nn.init.xavier_uniform_(self.fc11[0].weight)
++        self.fc11[0].bias.data.zero_()
++        nn.init.xavier_uniform_(self.fc12[0].weight)
++        self.fc12[0].bias.data.zero_()
++
++    def forward(self, x: torch.Tensor):
++        # Author expects x shape (B, T, F)
++        x = x.float()
++        x_img = x.view(-1, x.shape[2], 1, x.shape[1])  # (B, F, 1, T)
++
++        out_conv1 = self.conv1(x_img)
++        out1, idx1 = self.pool1(out_conv1)
++
++        out_conv2 = self.conv2(out1)
++        out2, idx2 = self.pool2(out_conv2)
++
++        out_conv3 = self.conv3(out2)
++        out3, idx3 = self.pool3(out_conv3)
++
++        out_conv4 = self.conv4(out3)
++        out4, idx4 = self.pool4(out_conv4)
++
++        out = out4.reshape(-1, out4.shape[1] * out4.shape[3])  # (B, 64*8)=512
++        size1 = out1.size()
++        size2 = out2.size()
++        size3 = out3.size()
++        size4 = out4.size()
++
++        mu = self.fc11(out)
++        scale = self.fc12(out) + 1e-7
++
++        return mu, scale, [idx1, idx2, idx3, idx4], [size1, size2, size3, size4]
++
++
++class QZY(nn.Module):
++    def __init__(self, d_dim, x_dim, y_dim, zd_dim, zx_dim, zy_dim, args):
++        super().__init__()
++        self.n_feature = args.n_feature
++
++        self.conv1 = nn.Sequential(nn.Conv2d(self.n_feature, 1024, kernel_size=(1, 5)), nn.ReLU())
++        self.pool1 = nn.MaxPool2d(kernel_size=(1, 2), stride=2, return_indices=True, ceil_mode=True)
++
++        self.conv2 = nn.Sequential(nn.Conv2d(1024, 512, kernel_size=(1, 1)), nn.ReLU())
++        self.pool2 = nn.MaxPool2d(kernel_size=(1, 2), stride=2, return_indices=True, ceil_mode=True)
++
++        self.conv3 = nn.Sequential(nn.Conv2d(512, 128, kernel_size=(1, 1)), nn.ReLU())
++        self.pool3 = nn.MaxPool2d(kernel_size=(1, 2), stride=2, return_indices=True, ceil_mode=True)
++
++        self.conv4 = nn.Sequential(nn.Conv2d(128, 64, kernel_size=(1, 1)), nn.ReLU())
++        self.pool4 = nn.MaxPool2d(kernel_size=(1, 2), stride=2, return_indices=True, ceil_mode=True)
++
++        self.fc11 = nn.Sequential(nn.Linear(512, zy_dim))
++        self.fc12 = nn.Sequential(nn.Linear(512, zy_dim), nn.Softplus())
++
++        nn.init.xavier_uniform_(self.conv1[0].weight)
++        nn.init.xavier_uniform_(self.conv2[0].weight)
++        nn.init.xavier_uniform_(self.conv3[0].weight)
++        nn.init.xavier_uniform_(self.conv4[0].weight)
++
++        nn.init.xavier_uniform_(self.fc11[0].weight)
++        self.fc11[0].bias.data.zero_()
++        nn.init.xavier_uniform_(self.fc12[0].weight)
++        self.fc12[0].bias.data.zero_()
++
++    def forward(self, x: torch.Tensor):
++        # Author expects x shape (B, T, F)
++        x = x.float()
++        x_img = x.view(-1, x.shape[2], 1, x.shape[1])  # (B, F, 1, T)
++
++        out_conv1 = self.conv1(x_img)
++        out1, idx1 = self.pool1(out_conv1)
++
++        out_conv2 = self.conv2(out1)
++        out2, idx2 = self.pool2(out_conv2)
++
++        out_conv3 = self.conv3(out2)
++        out3, idx3 = self.pool3(out_conv3)
++
++        out_conv4 = self.conv4(out3)
++        out4, idx4 = self.pool4(out_conv4)
++
++        out = out4.reshape(-1, out4.shape[1] * out4.shape[3])  # 512
++        size1 = out1.size()
++        size2 = out2.size()
++        size3 = out3.size()
++        size4 = out4.size()
++
++        mu = self.fc11(out)
++        scale = self.fc12(out) + 1e-7
++
++        return mu, scale, [idx1, idx2, idx3, idx4], [size1, size2, size3, size4]
++
++
++# ---------------------------
++# Auxiliary heads: q(d|z_d), q(y|z_y)
++# ---------------------------
++class QD(nn.Module):
++    def __init__(self, d_dim, x_dim, y_dim, zd_dim, zx_dim, zy_dim):
++        super().__init__()
++        self.fc1 = nn.Linear(zd_dim, d_dim)
++        nn.init.xavier_uniform_(self.fc1.weight)
++        self.fc1.bias.data.zero_()
++
++    def forward(self, zd):
++        h = F.relu(zd)
++        return self.fc1(h)
++
++
++class QY(nn.Module):
++    def __init__(self, d_dim, x_dim, y_dim, zd_dim, zx_dim, zy_dim):
++        super().__init__()
++        self.fc1 = nn.Linear(zy_dim, y_dim)
++        nn.init.xavier_uniform_(self.fc1.weight)
++        self.fc1.bias.data.zero_()
++
++    def forward(self, zy):
++        h = F.relu(zy)
++        return self.fc1(h)
++
++
++# ---------------------------
++# Main model: GILE(args)
++# ---------------------------
++class GILE(nn.Module):
++    def __init__(self, args):
++        super().__init__()
++
++        self.zd_dim = args.d_AE
++        self.zx_dim = 0
++        self.zy_dim = args.d_AE
++        self.d_dim = args.n_domains
++        self.x_dim = args.x_dim
++        self.y_dim = args.n_class
++
++        self.px = PX(self.d_dim, self.x_dim, self.y_dim, self.zd_dim, self.zx_dim, self.zy_dim, args)
++        self.pzd = DomainPrior(self.d_dim, self.x_dim, self.y_dim, self.zd_dim, self.zx_dim, self.zy_dim, args)
++        self.pzy = ClassPrior(self.d_dim, self.x_dim, self.y_dim, self.zd_dim, self.zx_dim, self.zy_dim, args)
++
++        self.qzd = QZD(self.d_dim, self.x_dim, self.y_dim, self.zd_dim, self.zx_dim, self.zy_dim, args)
++        self.qzy = QZY(self.d_dim, self.x_dim, self.y_dim, self.zd_dim, self.zx_dim, self.zy_dim, args)
++
++        self.qd = QD(self.d_dim, self.x_dim, self.y_dim, self.zd_dim, self.zx_dim, self.zy_dim)
++        self.qy = QY(self.d_dim, self.x_dim, self.y_dim, self.zd_dim, self.zx_dim, self.zy_dim)
++
++        self.aux_loss_multiplier_y = args.aux_loss_multiplier_y
++        self.aux_loss_multiplier_d = args.aux_loss_multiplier_d
++
++        self.beta_d = args.beta_d
++        self.beta_x = args.beta_x
++        self.beta_y = args.beta_y
++
++        # author does .cuda(); we instead follow args.device robustly
++        self.to(args.device)
++
++    def forward(self, d, x, y):
++        # Encode
++        zd_q_loc, zd_q_scale, _, _ = self.qzd(x)
++        zy_q_loc, zy_q_scale, idxs_y, sizes_y = self.qzy(x)
++
++        # Reparameterization
++        qzd = dist.Normal(zd_q_loc, zd_q_scale)
++        zd_q = qzd.rsample()
++
++        qzy = dist.Normal(zy_q_loc, zy_q_scale)
++        zy_q = qzy.rsample()
++
++        # Decode
++        x_recon = self.px(zd_q, None, zy_q, idxs_y, sizes_y)
++
++        # Priors
++        zd_p_loc, zd_p_scale = self.pzd(d)
++        zy_p_loc, zy_p_scale = self.pzy(y)
++
++        pzd = dist.Normal(zd_p_loc, zd_p_scale)
++        pzy = dist.Normal(zy_p_loc, zy_p_scale)
++
++        # Auxiliary logits
++        d_hat = self.qd(zd_q)
++        y_hat = self.qy(zy_q)
++
++        # Keep the exact tuple layout expected by author loss
++        qzx = None
++        pzx = None
++        zx_q = None
++        return x_recon, d_hat, y_hat, qzd, pzd, zd_q, qzx, pzx, zx_q, qzy, pzy, zy_q
++
++    def loss_function(self, d, x, y):
++        x_recon, d_hat, y_hat, qzd, pzd, zd_q, qzx, pzx, zx_q, qzy, pzy, zy_q = self.forward(d, x, y)
++
++        CE_x = F.mse_loss(x_recon, x.float())
++
++        zd_p_minus_zd_q = torch.sum(pzd.log_prob(zd_q) - qzd.log_prob(zd_q))
++        KL_zx = 0  # zx disabled in both author + your adaptation
++        zy_p_minus_zy_q = torch.sum(pzy.log_prob(zy_q) - qzy.log_prob(zy_q))
++
++        CE_d = F.cross_entropy(d_hat, d, reduction="sum")
++        CE_y = F.cross_entropy(y_hat, y, reduction="sum")
++
++        total = (
++            CE_x
++            - self.beta_d * zd_p_minus_zd_q
++            - self.beta_x * KL_zx
++            - self.beta_y * zy_p_minus_zy_q
++            + self.aux_loss_multiplier_d * CE_d
++            + self.aux_loss_multiplier_y * CE_y
++        )
++
++        return total, CE_y
++
++    def loss_function_false(self, args, d, x, y):
++        # identical call + math as author
++        pred_d, pred_y, pred_d_false, pred_y_false = self.classifier(x)
++
++        loss_classify_true = args.weight_true * (
++            F.cross_entropy(pred_d, d, reduction="sum") + F.cross_entropy(pred_y, y, reduction="sum")
++        )
++        loss_classify_false = args.weight_false * (
++            F.cross_entropy(pred_d_false, d, reduction="sum") + F.cross_entropy(pred_y_false, y, reduction="sum")
++        )
++
++        loss = loss_classify_true - loss_classify_false
++        loss.requires_grad = True
++        return loss
++
++    def classifier(self, x):
++        # EXACT author behavior (uses no_grad + one-hot scatter)
++        with torch.no_grad():
++            zd_q_loc, _, _, _ = self.qzd(x)
++            zd = zd_q_loc
++            alpha_d = F.softmax(self.qd(zd), dim=1)
++            _, ind = torch.topk(alpha_d, 1)
++            d = x.new_zeros(alpha_d.size()).scatter_(1, ind, 1.0)
++
++            zy_q_loc, _, _, _ = self.qzy(x)
++            zy = zy_q_loc
++            alpha_y = F.softmax(self.qy(zy), dim=1)
++            _, ind = torch.topk(alpha_y, 1)
++            y = x.new_zeros(alpha_y.size()).scatter_(1, ind, 1.0)
++
++            alpha_y2d = F.softmax(self.qd(zy), dim=1)
++            _, ind = torch.topk(alpha_y2d, 1)
++            d_false = x.new_zeros(alpha_y2d.size()).scatter_(1, ind, 1.0)
++
++            alpha_d2y = F.softmax(self.qy(zd), dim=1)
++            _, ind = torch.topk(alpha_d2y, 1)
++            y_false = x.new_zeros(alpha_d2y.size()).scatter_(1, ind, 1.0)
++
++        return d, y, d_false, y_false
++
++    def get_features(self, x):
++        zy_q_loc, zy_q_scale, _, _ = self.qzy(x)
++        qzy = dist.Normal(zy_q_loc, zy_q_scale)
++        return qzy.rsample()
++from argparse import Namespace
++import torch
++
++def make_gile_args_for_dataset(
++    *,
++    n_feature: int,      # F
++    n_class: int,        # #activities
++    n_domains: int,      # #domains
++    device: torch.device,
++    d_AE: int = 50,
++    x_dim: int = 1152,   # keep author default unless your code uses it elsewhere
++    aux_loss_multiplier_y: float = 1000.0,
++    aux_loss_multiplier_d: float = 1000.0,
++    beta_d: float = 1.0,
++    beta_x: float = 0.0,
++    beta_y: float = 1.0,
++    weight_true: float = 1000.0,
++    weight_false: float = 1000.0,
++):
++    return Namespace(
++        device=device,
++        n_feature=n_feature,
++        n_class=n_class,
++        n_domains=n_domains,
++        d_AE=d_AE,
++        x_dim=x_dim,
++        aux_loss_multiplier_y=aux_loss_multiplier_y,
++        aux_loss_multiplier_d=aux_loss_multiplier_d,
++        beta_d=beta_d,
++        beta_x=beta_x,
++        beta_y=beta_y,
++        weight_true=weight_true,
++        weight_false=weight_false,
++    )
+diff --git a/ucihar_dataloader.py b/ucihar_dataloader.py
+index b44e9d0..a25d88c 100644
+--- a/ucihar_dataloader.py
++++ b/ucihar_dataloader.py
+@@ -1,15 +1,102 @@
+-from __future__ import annotations
+-
++# encoding=utf-8
+ import os
+ import numpy as np
+-import torch
+ from torch.utils.data import Dataset, DataLoader
+ from torchvision import transforms
+-
++import torch
++from sliding_window import sliding_window
+ from utils import get_sample_weights
+-
+-UCIHAR_DATA_DIR = "./data/ucihar_preprocessed"  # adjust to your folder
+-
++import scipy.io
++import pickle as cp
++from sklearn.model_selection import StratifiedShuffleSplit
++
++
++# This is for parsing the X data, you can ignore it if you do not need preprocessing
++def format_data_x(datafile):
++    x_data = None
++    for item in datafile:
++        item_data = np.loadtxt(item, dtype=np.float64)
++        if x_data is None:
++            x_data = np.zeros((len(item_data), 1))
++        x_data = np.hstack((x_data, item_data))
++    x_data = x_data[:, 1:]
++    print('x_data.shape:', x_data.shape)
++    X = None
++    for i in range(len(x_data)):
++        row = np.asarray(x_data[i, :])
++        row = row.reshape(9, 128).T
++        if X is None:
++            X = np.zeros((len(x_data), 128, 9))
++        X[i] = row
++    print('X.shape:', X.shape)
++    return X
++
++def format_data_y(datafile):
++    data = np.loadtxt(datafile, dtype=np.int) - 1
++    return data
++
++
++def load_domain_data(domain_idx):
++    """ to load all the data from the specific domain
++    :param domain_idx:
++    :return: X and y data of the entire domain
++    """
++    data_dir = './data/ucihar_preprocessed/'
++    saved_filename = 'ucihar_domain_' + domain_idx + '_wd.data' # with domain label
++
++    if os.path.isfile(data_dir + saved_filename) == True:
++        data = np.load(data_dir + saved_filename, allow_pickle=True)
++        X = data[0][0]
++        y = data[0][1]
++        d = data[0][2]
++    else:
++        str_folder = './data/ucihar/'
++        INPUT_SIGNAL_TYPES = [
++            "body_acc_x_",
++            "body_acc_y_",
++            "body_acc_z_",
++            "body_gyro_x_",
++            "body_gyro_y_",
++            "body_gyro_z_",
++            "total_acc_x_",
++            "total_acc_y_",
++            "total_acc_z_"
++        ]
++        str_train_files = [str_folder + 'train/' + 'InertialSignals/' + item + 'train.txt' for item in
++                           INPUT_SIGNAL_TYPES]
++        str_test_files = [str_folder + 'test/' + 'InertialSignals/' + item + 'test.txt' for item in INPUT_SIGNAL_TYPES]
++        str_train_y = str_folder + 'train/y_train.txt'
++        str_test_y = str_folder + 'test/y_test.txt'
++
++        str_train_id = str_folder + 'train/subject_train.txt'
++        str_test_id = str_folder + 'test/subject_test.txt'
++
++        X_train = format_data_x(str_train_files)
++        X_test = format_data_x(str_test_files)
++        Y_train = format_data_y(str_train_y)
++        Y_test = format_data_y(str_test_y)
++        id_train = format_data_y(
++            str_train_id)  # origin: array([ 0,  2,  4,  5,  6,  7, 10, 13, 14, 15, 16, 18, 20, 21, 22, 24, 25, 26, 27, 28, 29])
++        id_test = format_data_y(str_test_id)  # origin: array([ 1,  3,  8,  9, 11, 12, 17, 19, 23])
++
++        X_all = np.concatenate((X_train, X_test), axis=0)
++        y_all = np.concatenate((Y_train, Y_test), axis=0)
++        id_all = np.concatenate((id_train, id_test), axis=0)
++
++        print('\nProcessing domain {0} files...\n'.format(domain_idx))
++        target_idx = np.where(id_all == int(domain_idx))
++        X = X_all[target_idx]
++        y = y_all[target_idx]
++        d = np.full(y.shape, int(domain_idx), dtype=int)
++        print('\nProcessing domain {0} files | X: {1} y: {2} d:{3} \n'.format(domain_idx, X.shape, y.shape, d.shape))
++
++        obj = [(X, y, d)]
++        # file function is not supported in python3, use open instead
++        f = open(os.path.join(data_dir, saved_filename), 'wb')
++        cp.dump(obj, f, protocol=cp.HIGHEST_PROTOCOL)
++        f.close()
++
++    return X, y, d
+ 
+ class data_loader_ucihar(Dataset):
+     def __init__(self, samples, labels, domains, t):
+@@ -27,82 +114,37 @@ class data_loader_ucihar(Dataset):
+         return len(self.samples)
+ 
+ 
+-def prep_domains_ucihar_preprocessed(
+-    batch_size: int = 64,
+-    target_domain: str = "0",
+-    data_dir: str = UCIHAR_DATA_DIR,
+-):
+-    """
+-    Build dataloaders from already-preprocessed domain files:
+-      ucihar_domain_{domain}_wd.data
+-    Each file must contain obj = [(X, y, d)] in the author's format.
+-    """
+-
+-    source_domain_list = ["0", "1", "2", "3", "4"]
+-    source_domain_list.remove(target_domain)
++def prep_domains_ucihar( SLIDING_WINDOW_LEN=0, SLIDING_WINDOW_STEP=0):
+ 
+-    transform = transforms.Compose(
+-        [
+-            transforms.ToTensor(),
+-            transforms.Normalize(
+-                mean=(0, 0, 0, 0, 0, 0, 0, 0, 0),
+-                std=(1, 1, 1, 1, 1, 1, 1, 1, 1),
+-            ),
+-        ]
+-    )
++    source_domain_list = ['0', '1', '2', '3', '4']
++    TARGET_DOMAIN ='4'
++    source_domain_list.remove(TARGET_DOMAIN)
+ 
++    # source domain data prep
+     source_loaders = []
+-
+-    # source domains
+     for source_domain in source_domain_list:
+-        print("source_domain:", source_domain)
+-
+-        domain_file = os.path.join(data_dir, f"ucihar_domain_{source_domain}_wd.data")
+-        data = np.load(domain_file, allow_pickle=True)
+-        x, y, d = data[0]  # (X, y, d) stored as obj=[(X,y,d)]
+-
+-        # match author tensor layout
+-        x = np.transpose(x.reshape((-1, 1, 128, 9)), (0, 2, 1, 3))  # [N,128,1,9]
+-        y = np.asarray(y).reshape(-1)
+-        d = np.asarray(d).reshape(-1)
+-
+-        # weighted sampling for class imbalance
++        print('source_domain:', source_domain)
++        x, y, d = load_domain_data(source_domain)
++        x = np.transpose(x.reshape((-1, 1, 128, 9)), (0, 2, 1, 3))
+         unique_y, counts_y = np.unique(y, return_counts=True)
+         weights = 100.0 / torch.Tensor(counts_y)
+         weights = weights.double()
+         sample_weights = get_sample_weights(y, weights)
+-
+-        sampler = torch.utils.data.sampler.WeightedRandomSampler(
+-            weights=sample_weights,
+-            num_samples=len(sample_weights),
+-            replacement=True,
+-        )
+-
+-        dataset = data_loader_ucihar(x, y, d, transform)
+-        loader = DataLoader(
+-            dataset,
+-            batch_size=batch_size,
+-            shuffle=False,
+-            drop_last=True,
+-            sampler=sampler,
+-        )
+-
+-        print("source_loader batch:", len(loader))
+-        source_loaders.append(loader)
+-
+-    # target domain
+-    print("target_domain:", target_domain)
+-
+-    domain_file = os.path.join(data_dir, f"ucihar_domain_{target_domain}_wd.data")
+-    data = np.load(domain_file, allow_pickle=True)
+-    x, y, d = data[0]
+-
++        sampler = torch.utils.data.sampler.WeightedRandomSampler(weights=sample_weights, num_samples=len(sample_weights), replacement=True)
++        transform = transforms.Compose([
++            transforms.ToTensor(),
++            transforms.Normalize(mean=(0, 0, 0, 0, 0, 0, 0, 0, 0), std=(1, 1, 1, 1, 1, 1, 1, 1, 1))
++        ])
++        data_set = data_loader_ucihar(x, y, d, transform)
++        source_loader = DataLoader(data_set, batch_size=64, shuffle=False, drop_last=True, sampler=sampler)
++        print('source_loader batch: ', len(source_loader))
++        source_loaders.append(source_loader)
++
++    # target domain data prep
++    print('target_domain:', TARGET_DOMAIN)
++    x, y, d = load_domain_data(TARGET_DOMAIN)
+     x = np.transpose(x.reshape((-1, 1, 128, 9)), (0, 2, 1, 3))
+-    y = np.asarray(y).reshape(-1)
+-    d = np.asarray(d).reshape(-1)
+-
+-    dataset = data_loader_ucihar(x, y, d, transform)
+-    target_loader = DataLoader(dataset, batch_size=batch_size, shuffle=False)
+-
+-    print("target_loader batch:", len(target_loader))
++    data_set = data_loader_ucihar(x, y, d, transform)
++    target_loader = DataLoader(data_set, batch_size=64, shuffle=False)
++    print('target_loader batch: ', len(target_loader))
+     return source_loaders, target_loader
+-- 
+2.50.1 (Apple Git-155)
+

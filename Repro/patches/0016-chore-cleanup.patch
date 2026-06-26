@@ -1,0 +1,493 @@
+From dc911bec41fcfd01fc5a9d6e2a3138da3f814887 Mon Sep 17 00:00:00 2001
+From: sinan-pourazari <sinan.pourazari@gmx.de>
+Date: Tue, 27 Jan 2026 20:06:16 +0100
+Subject: [PATCH 16/16] chore: cleanup
+
+---
+ main.py                | 22 ++-------------------
+ main_ucihar.py         | 43 ++++++++++--------------------------------
+ model_GLIE.py          |  4 ++--
+ oppor_dataloader_v2.py |  2 +-
+ shar_GILE.py           | 11 -----------
+ shar_main.py           | 25 ++----------------------
+ ucihar_GILE.py         | 22 ++-------------------
+ ucihar_dataloader.py   |  2 --
+ 8 files changed, 19 insertions(+), 112 deletions(-)
+
+diff --git a/main.py b/main.py
+index 2613d2b..f7fb354 100644
+--- a/main.py
++++ b/main.py
+@@ -19,26 +19,7 @@ device = "cuda" if torch.cuda.is_available() else "cpu"
+ SOURCE_DOMAINS = ["S1", "S2", "S3"]
+ TARGET_DOMAIN  = "S4"
+ 
+-"""train_loaders = [
+-    build_opportunity_loader(
+-        domain_ids=[dom],      # IMPORTANT: list, not string
+-        batch_size=64,
+-        shuffle=True,
+-        #expected_x_dim=30*77,
+-        label_type="gestures",
+-        #balanced= True
+-    )
+-    for dom in SOURCE_DOMAINS
+-]
+-
+-test_loader = build_opportunity_loader(
+-    domain_ids=[TARGET_DOMAIN],  # IMPORTANT: list, not string
+-    batch_size=4096,
+-    #expected_x_dim=30*77,
+-    shuffle=False,
+-    label_type="gestures",
+-)
+-"""
++
+ train_loaders, test_loader = prep_domains_oppor()
+ # model
+ model = GILE(
+@@ -157,6 +138,7 @@ def get_accuracy(source_loaders, DEVICE, model, classifier_fn, batch_size):
+             _, num_pred = pred.max(1)
+             v = torch.sum(num_pred == act)
+             accurate_preds_y_false += v
++            
+         # calculate the accuracy between 0 and 1
+         accuracy_y_false = (accurate_preds_y_false * 1.0) / (len(predictions_y_false) * batch_size)
+           # domain macro F1
+diff --git a/main_ucihar.py b/main_ucihar.py
+index 23871d5..8ec9d48 100644
+--- a/main_ucihar.py
++++ b/main_ucihar.py
+@@ -2,41 +2,35 @@ from argparse import Namespace
+ import torch
+ from sklearn.metrics import f1_score
+ 
+-# from your model file (the spec-faithful one)
+-from ucihar_GILE import GILE  # this should contain the GILE(args) version
++
++from ucihar_GILE import GILE
+ 
+ from oppor_dataloader_v2 import prep_domains_oppor
+ from ucihar_dataloader import prep_domains_ucihar
+ from shar_dataloader import prep_domains_shar_preprocessed
+ 
+ 
+-# -----------------------
+ # device
+-# -----------------------
+ DEVICE = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+ print("Device:", DEVICE)
+ 
+ 
+-# -----------------------
+-# dataloaders (example)
+-# IMPORTANT: loaders must yield x as (B, T, F) and y,d as label indices (B,)
+-# -----------------------
++# dataloaders 
+ train_loaders, test_loader = prep_domains_ucihar()
+ 
+ 
+-# -----------------------
+ # build args for spec-faithful model
+-# NOTE: set these to your dataset properties
+-# -----------------------
++
++
+ args = Namespace(
+     device=DEVICE,
+ 
+     # dataset structure
+-    n_feature=9,     # F (UCihar)
+-    n_class=6,       # #activities
+-    n_domains=5,     # #domains
++    n_feature=9,    
++    n_class=6,       
++    n_domains=5,     
+ 
+-    # model hyperparams (author defaults)
++    # model hyperparams 
+     d_AE=50,         # latent dim for z_d and z_y
+     x_dim=1152,      # kept for compatibility
+ 
+@@ -47,30 +41,22 @@ args = Namespace(
+     beta_x=0.0,
+     beta_y=1.0,
+ 
+-    # IE/false-step weights (used by loss_function_false)
++    # IE/false-step weights 
+     weight_true=1000.0,
+     weight_false=1000.0,
+ )
+ 
+ 
+-# -----------------------
+ # model
+-# -----------------------
+ model = GILE(args).to(DEVICE)
+ 
+ 
+-# -----------------------
+ # optimizers
+-# Author trains main + IE in separate steps; to match your pattern, use two optimizers.
+-# If you want strict author behavior, keep both on all params (as you already do).
+-# -----------------------
+ optimizer = torch.optim.Adam(model.parameters(), lr=1e-3, weight_decay=1e-3)
+ false_optimizer = torch.optim.Adam(model.parameters(), lr=1e-3, weight_decay=1e-3)
+ 
+ 
+-# -----------------------
+ # training
+-# -----------------------
+ def train_one_epoch(source_loaders):
+     model.train()
+     train_loss_sum = 0.0
+@@ -83,13 +69,11 @@ def train_one_epoch(source_loaders):
+             y = y.to(DEVICE).long().view(-1)
+             d = d.to(DEVICE).long().view(-1)
+ 
+-            # ----- main step -----
+             optimizer.zero_grad(set_to_none=True)
+             loss_origin, ce_y = model.loss_function(d, x, y)
+             loss_origin.backward()
+             optimizer.step()
+ 
+-            # ----- IE/false step -----
+             false_optimizer.zero_grad(set_to_none=True)
+             loss_false = model.loss_function_false(args, d, x, y)
+             loss_false.backward()
+@@ -98,21 +82,16 @@ def train_one_epoch(source_loaders):
+             bs = y.size(0)
+             total += bs
+ 
+-            # loss_origin and ce_y are tensors; accumulate as floats
+             train_loss_sum += float(loss_origin.detach().cpu())
+             class_y_loss_sum += float(ce_y.detach().cpu())
+ 
+-    # report per-sample averages (your old code did /total)
+     avg_loss = train_loss_sum / max(total, 1)
+     avg_ce_y = class_y_loss_sum / max(total, 1)
+     return avg_loss, avg_ce_y
+ 
+ 
+-# -----------------------
+ # evaluation
+ # classifier returns one-hot predictions (author style)
+-# so we convert: pred = onehot.argmax(1)
+-# -----------------------
+ @torch.no_grad()
+ def get_accuracy(loaders, device, model, classifier_fn, batch_size):
+     model.eval()
+@@ -163,9 +142,7 @@ def get_accuracy(loaders, device, model, classifier_fn, batch_size):
+     return acc_d, acc_y, acc_d_false, acc_y_false, d_macro_f1, y_macro_f1
+ 
+ 
+-# -----------------------
+ # run training
+-# -----------------------
+ torch.manual_seed(10)
+ 
+ for epoch in range(150):
+diff --git a/model_GLIE.py b/model_GLIE.py
+index ba807a2..89f69ee 100644
+--- a/model_GLIE.py
++++ b/model_GLIE.py
+@@ -431,8 +431,8 @@ class GILE(nn.Module):
+ 
+     def forward(self, x, y, d):
+         x = torch.unsqueeze(x, 1)
+-        d = d.long().view(-1)   # or d = d.squeeze(-1)
+-        y = y.long().view(-1)   # or y = y.squeeze(-1)
++        d = d.long().view(-1)   
++        y = y.long().view(-1) 
+ 
+         #encode
+         mu_y, sigma_y, pool_idx_y, pool_sizes_y = self.activity_encoder(x)
+diff --git a/oppor_dataloader_v2.py b/oppor_dataloader_v2.py
+index a2175d2..de70f7d 100644
+--- a/oppor_dataloader_v2.py
++++ b/oppor_dataloader_v2.py
+@@ -27,7 +27,7 @@ class data_loader_oppor(Dataset):
+         :param domain_idx:
+         :return: X and y data of the entire domain
+         """
+-        saved_filename = 'oppor_domain_' + domain_idx + '_wd.data' # with domain label
++        saved_filename = 'oppor_domain_' + domain_idx + '_wd.data' 
+         data = np.load(DATA_DIR + saved_filename, allow_pickle=True)
+         X = data[0][0]
+         y = data[0][1]
+diff --git a/shar_GILE.py b/shar_GILE.py
+index 7cf5408..dfc1ef6 100644
+--- a/shar_GILE.py
++++ b/shar_GILE.py
+@@ -7,9 +7,7 @@ import torch.distributions as dist
+ from typing import Optional, List
+ 
+ 
+-# ---------------------------
+ # Decoder: p(x | z_d, z_x, z_y)  (SHAR-specific: 640 -> (64,1,10), kernel (1,4))
+-# ---------------------------
+ class PX(nn.Module):
+     def __init__(self, n_feature: int, zd_dim: int, zx_dim: int, zy_dim: int):
+         super().__init__()
+@@ -67,9 +65,7 @@ class PX(nn.Module):
+         return out_44.permute(0, 2, 3, 1)
+ 
+ 
+-# ---------------------------
+ # Priors: p(z_d|d), p(z_y|y)
+-# ---------------------------
+ class DomainPrior(nn.Module):
+     def __init__(self, d_dim: int, zd_dim: int, device: torch.device):
+         super().__init__()
+@@ -122,10 +118,8 @@ class ClassPrior(nn.Module):
+         return mu, scale
+ 
+ 
+-# ---------------------------
+ # Encoders: q(z_d|x), q(z_y|x)  (SHAR-specific conv kernel (1,4), flatten=640)
+ # expects x shape (B, T, F) and reshapes to (B, F, 1, T)
+-# ---------------------------
+ class QZD(nn.Module):
+     def __init__(self, n_feature: int, zd_dim: int):
+         super().__init__()
+@@ -234,9 +228,7 @@ class QZY(nn.Module):
+         return mu, scale, [idx1, idx2, idx3, idx4], [size1, size2, size3, size4]
+ 
+ 
+-# ---------------------------
+ # Aux heads: q(d|z_d), q(y|z_y)
+-# ---------------------------
+ class QD(nn.Module):
+     def __init__(self, zd_dim: int, d_dim: int):
+         super().__init__()
+@@ -259,9 +251,7 @@ class QY(nn.Module):
+         return self.fc1(F.relu(zy))
+ 
+ 
+-# ---------------------------
+ # Main model: GILE(self-config) (NO argparse/args Namespace)
+-# ---------------------------
+ class GILE(nn.Module):
+     """
+     SHAR GILE variant:
+@@ -412,7 +402,6 @@ class GILE(nn.Module):
+         return loss
+ 
+     def classifier(self, x):
+-        # Author-style: no_grad + one-hot scatter
+         with torch.no_grad():
+             # d from zd
+             zd_q_loc, _, _, _ = self.qzd(x)
+diff --git a/shar_main.py b/shar_main.py
+index 47a457b..751fdcf 100644
+--- a/shar_main.py
++++ b/shar_main.py
+@@ -1,23 +1,10 @@
+-# shar_main.py (NO argparse) — works with the self-config GILE model
+-#
+-# expects:
+-#   - from model_GLIE import GILE   (the self-config version you asked for)
+-#   - from shar_dataloader import prep_domains_shar_preprocessed
+-# loader yields:
+-#   x: (B, T, F)  (e.g., (B,151,3))
+-#   y: (B,) int labels
+-#   d: (B,) int labels
+-
+ import torch
+ from sklearn.metrics import f1_score
+-
+ from shar_GILE import GILE
+ from shar_dataloader import prep_domains_shar_preprocessed
+ 
+ 
+-# -----------------------
+-# hyperparams (keep simple like your older scripts)
+-# -----------------------
++# hyperparams 
+ SEED = 10
+ BATCH_SIZE = 64
+ N_EPOCH = 100
+@@ -29,12 +16,9 @@ N_FEATURE = 3
+ N_CLASS = 17
+ N_DOMAINS = 6
+ D_AE = 50
+-LEN_SW = 151  # not used by model, but useful for sanity checks
++LEN_SW = 151 
+ 
+ 
+-# -----------------------
+-# device
+-# -----------------------
+ DEVICE = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+ print("Device:", DEVICE)
+ 
+@@ -124,16 +108,11 @@ def main():
+     torch.manual_seed(SEED)
+ 
+     # dataloaders
+-    # NOTE: if your prep_domains_shar_preprocessed() does not accept batch_size,
+-    # remove the arg and ensure it internally uses BATCH_SIZE.
+     train_loaders, test_loader = prep_domains_shar_preprocessed(batch_size=BATCH_SIZE)
+ 
+-    # optional sanity check (one batch)
+     x0, y0, d0 = next(iter(train_loaders[0]))
+     print("Sanity batch shapes:", x0.shape, y0.shape, d0.shape)
+-    # expected: (B, 151, 3) (B,) (B,)
+ 
+-    # model (self-config, no args namespace)
+     model = GILE(
+         n_feature=N_FEATURE,
+         n_class=N_CLASS,
+diff --git a/ucihar_GILE.py b/ucihar_GILE.py
+index 1be4310..9ba4215 100644
+--- a/ucihar_GILE.py
++++ b/ucihar_GILE.py
+@@ -7,9 +7,7 @@ import torch.distributions as dist
+ from typing import Optional, Tuple, List
+ 
+ 
+-# ---------------------------
+ # Decoder: p(x | z_d, z_x, z_y)
+-# ---------------------------
+ class PX(nn.Module):
+     def __init__(self, d_dim, x_dim, y_dim, zd_dim, zx_dim, zy_dim, args):
+         super().__init__()
+@@ -45,7 +43,6 @@ class PX(nn.Module):
+             nn.ReLU(),
+         )
+ 
+-        # init like author
+         nn.init.xavier_uniform_(self.fc1[0].weight)
+         nn.init.xavier_uniform_(self.deconv1[0].weight)
+         nn.init.xavier_uniform_(self.deconv2[0].weight)
+@@ -73,14 +70,11 @@ class PX(nn.Module):
+         out_4 = self.un4(out_33, idxs[0])
+         out_44 = self.deconv4(out_4)
+ 
+-        # EXACT author permute
+         out = out_44.permute(0, 3, 1, 2)
+         return out
+ 
+ 
+-# ---------------------------
+ # Priors: p(z_d | d), p(z_y | y)
+-# ---------------------------
+ class DomainPrior(nn.Module):
+     def __init__(self, d_dim, x_dim, y_dim, zd_dim, zx_dim, zy_dim, args):
+         super().__init__()
+@@ -131,9 +125,7 @@ class ClassPrior(nn.Module):
+         return mu, scale
+ 
+ 
+-# ---------------------------
+ # Encoders: q(z_d|x), q(z_y|x)
+-# ---------------------------
+ class QZD(nn.Module):
+     def __init__(self, d_dim, x_dim, y_dim, zd_dim, zx_dim, zy_dim, args):
+         super().__init__()
+@@ -165,7 +157,6 @@ class QZD(nn.Module):
+         self.fc12[0].bias.data.zero_()
+ 
+     def forward(self, x: torch.Tensor):
+-        # Author expects x shape (B, T, F)
+         x = x.float()
+         x_img = x.view(-1, x.shape[2], 1, x.shape[1])  # (B, F, 1, T)
+ 
+@@ -224,7 +215,6 @@ class QZY(nn.Module):
+         self.fc12[0].bias.data.zero_()
+ 
+     def forward(self, x: torch.Tensor):
+-        # Author expects x shape (B, T, F)
+         x = x.float()
+         x_img = x.view(-1, x.shape[2], 1, x.shape[1])  # (B, F, 1, T)
+ 
+@@ -252,9 +242,7 @@ class QZY(nn.Module):
+         return mu, scale, [idx1, idx2, idx3, idx4], [size1, size2, size3, size4]
+ 
+ 
+-# ---------------------------
+ # Auxiliary heads: q(d|z_d), q(y|z_y)
+-# ---------------------------
+ class QD(nn.Module):
+     def __init__(self, d_dim, x_dim, y_dim, zd_dim, zx_dim, zy_dim):
+         super().__init__()
+@@ -279,9 +267,7 @@ class QY(nn.Module):
+         return self.fc1(h)
+ 
+ 
+-# ---------------------------
+ # Main model: GILE(args)
+-# ---------------------------
+ class GILE(nn.Module):
+     def __init__(self, args):
+         super().__init__()
+@@ -310,7 +296,6 @@ class GILE(nn.Module):
+         self.beta_x = args.beta_x
+         self.beta_y = args.beta_y
+ 
+-        # author does .cuda(); we instead follow args.device robustly
+         self.to(args.device)
+ 
+     def forward(self, d, x, y):
+@@ -339,7 +324,6 @@ class GILE(nn.Module):
+         d_hat = self.qd(zd_q)
+         y_hat = self.qy(zy_q)
+ 
+-        # Keep the exact tuple layout expected by author loss
+         qzx = None
+         pzx = None
+         zx_q = None
+@@ -351,7 +335,7 @@ class GILE(nn.Module):
+         CE_x = F.mse_loss(x_recon, x.float())
+ 
+         zd_p_minus_zd_q = torch.sum(pzd.log_prob(zd_q) - qzd.log_prob(zd_q))
+-        KL_zx = 0  # zx disabled in both author + your adaptation
++        KL_zx = 0 
+         zy_p_minus_zy_q = torch.sum(pzy.log_prob(zy_q) - qzy.log_prob(zy_q))
+ 
+         CE_d = F.cross_entropy(d_hat, d, reduction="sum")
+@@ -369,7 +353,6 @@ class GILE(nn.Module):
+         return total, CE_y
+ 
+     def loss_function_false(self, args, d, x, y):
+-        # identical call + math as author
+         pred_d, pred_y, pred_d_false, pred_y_false = self.classifier(x)
+ 
+         loss_classify_true = args.weight_true * (
+@@ -384,7 +367,6 @@ class GILE(nn.Module):
+         return loss
+ 
+     def classifier(self, x):
+-        # EXACT author behavior (uses no_grad + one-hot scatter)
+         with torch.no_grad():
+             zd_q_loc, _, _, _ = self.qzd(x)
+             zd = zd_q_loc
+@@ -422,7 +404,7 @@ def make_gile_args_for_dataset(
+     n_domains: int,      # #domains
+     device: torch.device,
+     d_AE: int = 50,
+-    x_dim: int = 1152,   # keep author default unless your code uses it elsewhere
++    x_dim: int = 1152,   
+     aux_loss_multiplier_y: float = 1000.0,
+     aux_loss_multiplier_d: float = 1000.0,
+     beta_d: float = 1.0,
+diff --git a/ucihar_dataloader.py b/ucihar_dataloader.py
+index a25d88c..91ed958 100644
+--- a/ucihar_dataloader.py
++++ b/ucihar_dataloader.py
+@@ -1,4 +1,3 @@
+-# encoding=utf-8
+ import os
+ import numpy as np
+ from torch.utils.data import Dataset, DataLoader
+@@ -11,7 +10,6 @@ import pickle as cp
+ from sklearn.model_selection import StratifiedShuffleSplit
+ 
+ 
+-# This is for parsing the X data, you can ignore it if you do not need preprocessing
+ def format_data_x(datafile):
+     x_data = None
+     for item in datafile:
+-- 
+2.50.1 (Apple Git-155)
+

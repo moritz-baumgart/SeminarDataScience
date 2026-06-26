@@ -1,0 +1,305 @@
+From 2df9d8956057d1f293e53eb1bb40fba3800edf6c Mon Sep 17 00:00:00 2001
+From: sinan-pourazari <sinan.pourazari@gmx.de>
+Date: Tue, 20 Jan 2026 02:02:01 +0100
+Subject: [PATCH 11/16] fix: optimizer now target proper model parameters
+
+---
+ main.py       |  55 ++++++++++++++++++++------
+ model_GLIE.py | 104 +++++++++++++-------------------------------------
+ 2 files changed, 70 insertions(+), 89 deletions(-)
+
+diff --git a/main.py b/main.py
+index b08ad1e..9554e99 100644
+--- a/main.py
++++ b/main.py
+@@ -10,10 +10,10 @@ from oppor_dataloader_v2 import build_opportunity_loader
+ # hyperparameter
+ aux_loss_multiplier_y = 100
+ aux_loss_multiplier_d = 100
+-beta_d = 1
++beta_d = 0.002
+ beta_y = 10
+ weight_true = 100
+-weight_false = 100
++weight_false = 10
+ latent_dim = 50
+ 
+ # device
+@@ -27,6 +27,7 @@ train_loaders = [
+         domain_ids=[dom],      # IMPORTANT: list, not string
+         batch_size=64,
+         shuffle=True,
++        expected_x_dim=30*77,
+         label_type="gestures",
+         balanced= True
+     )
+@@ -36,6 +37,7 @@ train_loaders = [
+ test_loader = build_opportunity_loader(
+     domain_ids=[TARGET_DOMAIN],  # IMPORTANT: list, not string
+     batch_size=4096,
++    expected_x_dim=30*77,
+     shuffle=False,
+     label_type="gestures",
+ )
+@@ -68,8 +70,8 @@ main_params = (
+ )
+ 
+ ie_params = (
+-    list(model.activity_encoder.parameters()) +
+-    list(model.domain_encoder.parameters()) +
++    #list(model.activity_encoder.parameters()) +
++    #list(model.domain_encoder.parameters()) +
+     list(model.activity_classifier.parameters()) +
+     list(model.domain_classifier.parameters())
+ 
+@@ -82,6 +84,7 @@ def train_one_epoch(model, train_loaders, opt_main, opt_ie):
+ 
+     total_main = 0.0
+     total_ie = 0.0
++    total_dc = 0.0
+     total = 0
+ 
+     for loader in train_loaders:
+@@ -99,11 +102,21 @@ def train_one_epoch(model, train_loaders, opt_main, opt_ie):
+             # --------------------------------------------------
+             opt_main.zero_grad(set_to_none=True)
+             opt_ie.zero_grad(set_to_none=True)
++            if not torch.isfinite(x).all():
++                raise RuntimeError("Non-finite x coming from DataLoader")
+             out = model(x, y, d)
+             loss_main = model.loss_function_elbo(x=x, y=y, d=d, pred = out)
+             loss_main.backward()
+             opt_main.step()
+ 
++
++            # after opt_main.step()
++            assert_finite_module(model.domain_encoder, "domain_encoder")
++            assert_finite_module(model.activity_encoder, "activity_encoder")
++
++            # after opt_dc.step() / opt_ie.step()
++            assert_finite_module(model.domain_encoder, "domain_encoder")
++            
+             total_main += loss_main.item() * batch_size
+ 
+             # --------------------------------------------------
+@@ -114,10 +127,11 @@ def train_one_epoch(model, train_loaders, opt_main, opt_ie):
+ 
+             # Important: recompute forward path if your loss_function_false
+             # depends on stochastic sampling. If it's deterministic, you can keep it.
++            if not torch.isfinite(x).all():
++                raise RuntimeError("Non-finite x coming from DataLoader2")            
+             out = model(x, y, d)
+             loss_dc = model.loss_function_dc(x,y,d,out)
+-            loss_ie = model.loss_function_ie(x, y, d)
+-
++            loss_ie = model.loss_function_ie(x, y, d,out)
+ 
+ 
+             loss_dcie= loss_dc+loss_ie
+@@ -126,16 +140,28 @@ def train_one_epoch(model, train_loaders, opt_main, opt_ie):
+             loss_dcie.backward()
+             opt_ie.step()
+ 
+-            total_ie += loss_ie.item() * batch_size
+ 
++            # after opt_main.step()
++            assert_finite_module(model.domain_encoder, "domain_encoder")
++            assert_finite_module(model.activity_encoder, "activity_encoder")
++
++            # after opt_dc.step() / opt_ie.step()
++            assert_finite_module(model.domain_encoder, "domain_encoder")
++
++            total_ie += loss_ie.item() * batch_size
++            total_dc += loss_dc.item() * batch_size
+     denom = max(total, 1)
+     return {
+         "loss_main": total_main / denom,
+         "loss_ie": total_ie / denom,
++        "loss_dc" : total_dc / denom,
+         "loss_total": (total_main + total_ie) / denom,
+     }
+-
+-
++def assert_finite_module(m, name):
++    with torch.no_grad():
++        for n, p in m.named_parameters():
++            if not torch.isfinite(p).all():
++                raise RuntimeError(f"Non-finite param after step: {name}.{n}")
+ @torch.no_grad()
+ def evaluate(model, loaders):
+     model.eval()
+@@ -151,9 +177,13 @@ def evaluate(model, loaders):
+             x, y, d = x.to(device), y.to(device), d.to(device)
+ 
+             d_hat, y_hat, d_false, y_false = model.classify(x)
+-            y_pred = torch.argmax(y_hat, dim=1)
+-            d_pred = torch.argmax(d_false, dim=1)
+ 
++            y_pred = y_hat.argmax(dim=1)      # activity prediction
++            d_pred = d_hat.argmax(dim=1)      # domain prediction (if you want domain accuracy)
++
++           
++            d_cross_pred = d_false.argmax(dim=1)  # domain from activity latent
++            
+             all_y_true.append(y.detach().cpu())
+             all_y_pred.append(y_pred.detach().cpu())
+             all_d_true.append(d.detach().cpu())
+@@ -194,7 +224,7 @@ def evaluate(model, loaders):
+         "domain_accuracy": domain_accuracy,
+     }
+ 
+-
++torch.manual_seed(10)
+ for epoch in range(500):
+     loss = train_one_epoch(model, train_loaders, opt_main, opt_ie)
+     metrics_train = evaluate(model, train_loaders)
+@@ -203,6 +233,7 @@ for epoch in range(500):
+             f"Epoch {epoch:02d} | "
+             f"Train Loss main: {loss["loss_main"]:.4f} | "
+             f"Train Loss ie: {loss["loss_ie"]:.4f} | "
++            f"Train Loss dc: {loss["loss_dc"]:.4f} |" 
+             f"Train Loss total: {loss["loss_total"]:.4f} | "
+             f"Act F1 (macro): {metrics_test['activity_f1_macro']:.3f} | "
+             f"Act F1 (weighted): {metrics_test['activity_f1_weighted']:.3f} | "
+diff --git a/model_GLIE.py b/model_GLIE.py
+index b4dd1c5..2c32fe5 100644
+--- a/model_GLIE.py
++++ b/model_GLIE.py
+@@ -623,6 +623,8 @@ class GILE(nn.Module):
+         y_hat  = self.activity_classifier(zy_q)
+         d_hat  = self.domain_classifier(zd_q)
+ 
++        y_cross  = self.activity_classifier(zd_q)
++        d_cross  = self.domain_classifier(zy_q)
+ 
+         return {
+             "x_recon": x_recon,
+@@ -636,7 +638,9 @@ class GILE(nn.Module):
+             "zd_q": zd_q,
+             "qzy": qzy,
+             "pzy": pzy,
+-            "zy_q": zy_q
++            "zy_q": zy_q,
++            "y_cross":y_cross,
++            "d_cross":d_cross
+ 
+         }
+     
+@@ -671,92 +675,38 @@ class GILE(nn.Module):
+ 
+         return self.aux_loss_multiplier_d * CE_d + self.aux_loss_multiplier_y * CE_y
+ 
+-    def loss_function_ie(self, x, y, d):
+-        """
+-        Independent Excitation loss
+-        Encourages:
+-            z_d -> d
+-            z_y -> y
+-        Discourages:
+-            z_y -> d
+-            z_d -> y
+-        """
+-
++    def loss_function_ie(self, x, y, d, pred):
+         d = d.long()
+         y = y.long()
+ 
+-        d_hat, y_hat, d_false, y_false = self.classify(x)
+-
+-        #loss_true  = self.weight_true  * (F.cross_entropy(d_hat, d, reduction="mean") + F.cross_entropy(y_hat, y, reduction="mean"))
+-        loss_false = self.weight_false * (F.cross_entropy(d_false, d, reduction="mean") + F.cross_entropy(y_false, y, reduction="mean"))
+-        
+-        loss_false = loss_false.detach()
+-        loss_false.requires_grad_(True)
+-
++        # use logits already computed in forward (best)
++        loss_false = (
++            F.cross_entropy(pred["d_cross"], d, reduction="mean") +
++            F.cross_entropy(pred["y_cross"], y, reduction="mean")
++        )
++        return -self.weight_false * loss_false
+ 
+-        return  -loss_false
+     
+     @torch.no_grad()
+     def classify_no_inf(self,x):
+         return self.classify(x)
+ 
+     def classify(self, x):
+-            """
+-            classify a batch of inputs x
+-            returns:
+-                d_hat    : z_d -> d (true)
+-                y_hat    : z_y -> y (true)
+-                d_false  : z_y -> d (false)
+-                y_false  : z_d -> y (false)
+-            """
+-            #with torch.no_grad():
+-
+-            # ------------------------------
+-            # encode
+-            # ------------------------------
+-            zy_q_loc, _, _, _ = self.activity_encoder(x)
+-            zd_q_loc, _, _, _ = self.domain_encoder(x)
+-
+-            zy = zy_q_loc
+-            zd = zd_q_loc
+-
+-            # ------------------------------
+-            # TRUE: z_d -> d
+-            # ------------------------------
+-            alpha_d = self.domain_classifier(zd)
+-            _, ind = torch.topk(alpha_d, 1)
+-
+-            d_hat = x.new_zeros(alpha_d.size())
+-            d_hat = d_hat.scatter_(1, ind, 1.0)
+-
+-            # ------------------------------
+-            # TRUE: z_y -> y
+-            # ------------------------------
+-            alpha_y = self.activity_classifier(zy)
+-            _, ind = torch.topk(alpha_y, 1)
+-
+-            y_hat = x.new_zeros(alpha_y.size())
+-            y_hat = y_hat.scatter_(1, ind, 1.0)
+-
+-            # ------------------------------
+-            # FALSE: z_y -> d
+-            # ------------------------------
+-            alpha_y2d = self.domain_classifier(zy)
+-            _, ind = torch.topk(alpha_y2d, 1)
+-
+-            d_false = x.new_zeros(alpha_y2d.size())
+-            d_false = d_false.scatter_(1, ind, 1.0)
+-
+-            # ------------------------------
+-            # FALSE: z_d -> y
+-            # ------------------------------
+-            alpha_d2y = self.activity_classifier(zd)
+-            _, ind = torch.topk(alpha_d2y, 1)
+-
+-            y_false = x.new_zeros(alpha_d2y.size())
+-            y_false = y_false.scatter_(1, ind, 1.0)
+-
+-            return d_hat, y_hat, d_false, y_false
++        # encode
++        zy_loc, _, _, _ = self.activity_encoder(x)
++        zd_loc, _, _, _ = self.domain_encoder(x)
++
++        zy = zy_loc
++        zd = zd_loc
++
++        # logits (NOT one-hot)
++        d_hat   = self.domain_classifier(zd)   # z_d -> d
++        y_hat   = self.activity_classifier(zy) # z_y -> y
++        d_false = self.domain_classifier(zy)   # z_y -> d
++        y_false = self.activity_classifier(zd) # z_d -> y
++
++        return d_hat, y_hat, d_false, y_false
++
+ 
+ 
+ 
+-- 
+2.50.1 (Apple Git-155)
+

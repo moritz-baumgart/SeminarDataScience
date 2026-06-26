@@ -1,0 +1,1581 @@
+From 8f100400bfe4f03ea83caa2f391aadeb5bfdbd4e Mon Sep 17 00:00:00 2001
+From: sinan-pourazari <sinan.pourazari@gmx.de>
+Date: Wed, 21 Jan 2026 13:52:47 +0100
+Subject: [PATCH 12/16] fix: actually works now
+
+---
+ main.py                | 318 +++++++++-------------
+ model_GLIE.py          | 592 ++++++++++++++++-------------------------
+ oppor_dataloader_v2.py | 320 +++++++++-------------
+ utils.py               |  14 +
+ 4 files changed, 492 insertions(+), 752 deletions(-)
+
+diff --git a/main.py b/main.py
+index 9554e99..653876a 100644
+--- a/main.py
++++ b/main.py
+@@ -5,31 +5,30 @@ from utils import GradReverse
+ import torch
+ import torch.nn.functional as F
+ from sklearn.metrics import f1_score
+-#from oppor_prepro_dataloader import build_opportunity_loader
+-from oppor_dataloader_v2 import build_opportunity_loader
++from oppor_prepro_dataloader import build_opportunity_loader
++from oppor_dataloader_v2 import prep_domains_oppor
+ # hyperparameter
+-aux_loss_multiplier_y = 100
+-aux_loss_multiplier_d = 100
+-beta_d = 0.002
+-beta_y = 10
+-weight_true = 100
+-weight_false = 10
+-latent_dim = 50
++beta_kl = 0.1    # KL-Regularisierung
++alpha_cls = 1.0    # Klassifikations-Loss
++gamma_ie = 0.2     # Independent Excitation
++aux_y    = 1.0
++aux_d    = 1.0
+ 
+ # device
+ device = "cuda" if torch.cuda.is_available() else "cpu"
+ 
++# dataloader (LOSO)
+ SOURCE_DOMAINS = ["S1", "S2", "S3"]
+ TARGET_DOMAIN  = "S4"
+ 
+-train_loaders = [
++"""train_loaders = [
+     build_opportunity_loader(
+         domain_ids=[dom],      # IMPORTANT: list, not string
+         batch_size=64,
+         shuffle=True,
+-        expected_x_dim=30*77,
++        #expected_x_dim=30*77,
+         label_type="gestures",
+-        balanced= True
++        #balanced= True
+     )
+     for dom in SOURCE_DOMAINS
+ ]
+@@ -37,215 +36,160 @@ train_loaders = [
+ test_loader = build_opportunity_loader(
+     domain_ids=[TARGET_DOMAIN],  # IMPORTANT: list, not string
+     batch_size=4096,
+-    expected_x_dim=30*77,
++    #expected_x_dim=30*77,
+     shuffle=False,
+     label_type="gestures",
+ )
+-
+-
++"""
++train_loaders, test_loader = prep_domains_oppor()
+ # model
+ model = GILE(
+-    input_dim=30*77,
++    input_dim=77,
+     activity_classes=18,
+     domain_classes=4,
+-    latent_dim=latent_dim,
+-    weight_true = weight_true,
+-    weight_false = weight_false,
+-    beta_domain= beta_d,
+-    beta_activity= beta_y,
+-    aux_loss_multiplier_y= aux_loss_multiplier_y,
+-    aux_loss_multiplier_d= aux_loss_multiplier_d,
+-    zx_dim= 0,
+-
++    latent_dim=16,
+ ).to(device)
+ print(device)
+ 
+ 
+-main_params = (
+-    list(model.activity_encoder.parameters()) +
+-    list(model.domain_encoder.parameters()) +
+-    list(model.decoder.parameters()) +
+-    list(model.activity_prior.parameters()) +
+-    list(model.domain_prior.parameters())
+-)
++#ie_params = (
+ 
+-ie_params = (
+-    #list(model.activity_encoder.parameters()) +
+-    #list(model.domain_encoder.parameters()) +
+-    list(model.activity_classifier.parameters()) +
+-    list(model.domain_classifier.parameters())
+ 
+-)# model.parameters()
+-opt_main = torch.optim.Adam(main_params, lr=1e-4, weight_decay=1e-3)
+-opt_ie   = torch.optim.Adam(ie_params, lr=1e-3, weight_decay=1e-3)
++main_params = []
++for name, p in model.named_parameters():
++    if name.startswith("activity_classifier_ie") or name.startswith("domain_classifier_ie"):
++        continue
++    main_params.append(p)
+ 
+-def train_one_epoch(model, train_loaders, opt_main, opt_ie):
+-    model.train()
++optimizer = torch.optim.Adam(model.parameters(), lr=1e-3, weight_decay=1e-3)
++false_optimizer   = torch.optim.Adam(model.parameters(),   lr=1e-3, weight_decay=1e-3)
+ 
+-    total_main = 0.0
+-    total_ie = 0.0
+-    total_dc = 0.0
+-    total = 0
+-
+-    for loader in train_loaders:
+-        for x, y, d in loader:
+-            x = x.to(device, non_blocking=True)
+-            y = y.to(device, non_blocking=True)
+-            d = d.to(device, non_blocking=True)
+-
+-            batch_size = x.size(0)
+-            total += batch_size
+-
+-            # --------------------------------------------------
+-            # (1) MAIN STEP
+-            # train encoder / decoder / priors / true classifiers
+-            # --------------------------------------------------
+-            opt_main.zero_grad(set_to_none=True)
+-            opt_ie.zero_grad(set_to_none=True)
+-            if not torch.isfinite(x).all():
+-                raise RuntimeError("Non-finite x coming from DataLoader")
+-            out = model(x, y, d)
+-            loss_main = model.loss_function_elbo(x=x, y=y, d=d, pred = out)
+-            loss_main.backward()
+-            opt_main.step()
+-
+-
+-            # after opt_main.step()
+-            assert_finite_module(model.domain_encoder, "domain_encoder")
+-            assert_finite_module(model.activity_encoder, "activity_encoder")
+-
+-            # after opt_dc.step() / opt_ie.step()
+-            assert_finite_module(model.domain_encoder, "domain_encoder")
++def train_one_epoch(source_loaders):
++    model.train()
++    train_loss = 0.0
++    total = 0.0
++    epoch_class_y_loss = 0.0
++    for source_loader in source_loaders:
++        for x, y, d in source_loader:
++
++            x = x.to(device)
++            y = y.to(device)
++            d = d.to(device)
+             
+-            total_main += loss_main.item() * batch_size
++            optimizer.zero_grad()
++            false_optimizer.zero_grad()
+ 
+-            # --------------------------------------------------
+-            # (2) IE / FALSE STEP
+-            # train ONLY IE heads (i.e., only params in opt_ie)
+-            # --------------------------------------------------
+-            
++            loss_origin, class_y_loss = model.compute_loss(x, y,d)
+ 
+-            # Important: recompute forward path if your loss_function_false
+-            # depends on stochastic sampling. If it's deterministic, you can keep it.
+-            if not torch.isfinite(x).all():
+-                raise RuntimeError("Non-finite x coming from DataLoader2")            
+-            out = model(x, y, d)
+-            loss_dc = model.loss_function_dc(x,y,d,out)
+-            loss_ie = model.loss_function_ie(x, y, d,out)
++            loss_false = model.compute_loss_false(x, y,d)
+ 
++            
++            loss_origin.backward()
++            optimizer.step()
++            loss_false.backward()
++            false_optimizer.step()
+ 
+-            loss_dcie= loss_dc+loss_ie
++            train_loss += loss_origin
++            epoch_class_y_loss += class_y_loss
++            total += y.size(0)
+ 
++    train_loss /= total
++    epoch_class_y_loss /= total
+ 
+-            loss_dcie.backward()
+-            opt_ie.step()
++    return train_loss, epoch_class_y_loss
+ 
+ 
+-            # after opt_main.step()
+-            assert_finite_module(model.domain_encoder, "domain_encoder")
+-            assert_finite_module(model.activity_encoder, "activity_encoder")
+ 
+-            # after opt_dc.step() / opt_ie.step()
+-            assert_finite_module(model.domain_encoder, "domain_encoder")
+ 
+-            total_ie += loss_ie.item() * batch_size
+-            total_dc += loss_dc.item() * batch_size
+-    denom = max(total, 1)
+-    return {
+-        "loss_main": total_main / denom,
+-        "loss_ie": total_ie / denom,
+-        "loss_dc" : total_dc / denom,
+-        "loss_total": (total_main + total_ie) / denom,
+-    }
+-def assert_finite_module(m, name):
+-    with torch.no_grad():
+-        for n, p in m.named_parameters():
+-            if not torch.isfinite(p).all():
+-                raise RuntimeError(f"Non-finite param after step: {name}.{n}")
+-@torch.no_grad()
+-def evaluate(model, loaders):
++def get_accuracy(source_loaders, DEVICE, model, classifier_fn, batch_size):
+     model.eval()
+-    if not isinstance(loaders, (list, tuple)):
+-        loaders = [loaders]
++    """
++    compute the accuracy over the supervised training set or the testing set
++    """
++    predictions_d, actuals_d, predictions_y, actuals_y = [], [], [], []
++    predictions_d_false, predictions_y_false = [], []
+ 
+-    all_y_true, all_y_pred = [], []
+-    all_d_true, all_d_pred = [], []
+-    correct_y = correct_d = total = 0
++    with torch.no_grad():
++        for source_loader in source_loaders:
++            for (xs, ys, ds) in source_loader:
+ 
+-    for loader in loaders:
+-        for x, y, d in loader:
+-            x, y, d = x.to(device), y.to(device), d.to(device)
++                xs, ys, ds = xs.to(DEVICE), ys.to(DEVICE), ds.to(DEVICE)
+ 
+-            d_hat, y_hat, d_false, y_false = model.classify(x)
++                # use classification function to compute all predictions for each batch
++                pred_d, pred_y, pred_d_false, pred_y_false = classifier_fn(xs)
++                predictions_d.append(pred_d)
++                predictions_d_false.append(pred_d_false)
++                actuals_d.append(ds)
+ 
+-            y_pred = y_hat.argmax(dim=1)      # activity prediction
+-            d_pred = d_hat.argmax(dim=1)      # domain prediction (if you want domain accuracy)
++                predictions_y.append(pred_y)
++                predictions_y_false.append(pred_y_false)
++                actuals_y.append(ys)
+ 
+-           
+-            d_cross_pred = d_false.argmax(dim=1)  # domain from activity latent
+-            
+-            all_y_true.append(y.detach().cpu())
+-            all_y_pred.append(y_pred.detach().cpu())
+-            all_d_true.append(d.detach().cpu())
+-            all_d_pred.append(d_pred.detach().cpu())
++        # compute the number of accurate predictions
++        accurate_preds_d = 0
++        accurate_preds_d_false = 0
++        for pred, act in zip(predictions_d, actuals_d):
++            _, num_pred = pred.max(1)
++            v = torch.sum(num_pred == act)
++            accurate_preds_d += v
+ 
+-            correct_y += (y_pred == y).sum().item()
+-            correct_d += (d_pred == d).sum().item()
+-            total += y.size(0)
++        accuracy_d = (accurate_preds_d * 1.0) / (len(predictions_d) * batch_size)
+ 
+-    # concatenate for F1
+-    y_true = torch.cat(all_y_true).numpy()
+-    y_pred = torch.cat(all_y_pred).numpy()
+-
+-    d_true = torch.cat(all_d_true).numpy()
+-    d_pred = torch.cat(all_d_pred).numpy()
+-
+-    # F1 metrics 
+-    activity_f1_macro = f1_score(y_true, y_pred, average="macro")
+-    activity_f1_weighted = f1_score(y_true, y_pred, average="weighted")
+-    domain_f1_macro = f1_score(d_true, d_pred, average="macro")
+-
+-    # accuracy metrics (authors' evaluation)
+-    #activity_accuracy = correct_y / max(total, 1)
+-    #domain_accuracy = correct_d / max(total, 1)
+-
+-    # accuracy metrics (authors' evaluation: correct / (n_batches * batch_size))
+-    batch_size = getattr(loader, "batch_size", None) or 1
+-    n_batches = len(all_y_true)  # you append once per batch
+-    denom_authors = max(n_batches * batch_size, 1)
+-
+-    activity_accuracy = correct_y / denom_authors
+-    domain_accuracy = correct_d / denom_authors
+-    return {
+-        "activity_f1_macro": activity_f1_macro,
+-        "activity_f1_weighted": activity_f1_weighted,
+-        "domain_f1_macro": domain_f1_macro,
+-        "activity_accuracy": activity_accuracy,
+-        "domain_accuracy": domain_accuracy,
+-    }
++        for pred, act in zip(predictions_d_false, actuals_d):
++            _, num_pred = pred.max(1)
++            v = torch.sum(num_pred == act)
++            accurate_preds_d_false += v
+ 
+-torch.manual_seed(10)
+-for epoch in range(500):
+-    loss = train_one_epoch(model, train_loaders, opt_main, opt_ie)
+-    metrics_train = evaluate(model, train_loaders)
+-    metrics_test  = evaluate(model, [test_loader])
+-    print(
+-            f"Epoch {epoch:02d} | "
+-            f"Train Loss main: {loss["loss_main"]:.4f} | "
+-            f"Train Loss ie: {loss["loss_ie"]:.4f} | "
+-            f"Train Loss dc: {loss["loss_dc"]:.4f} |" 
+-            f"Train Loss total: {loss["loss_total"]:.4f} | "
+-            f"Act F1 (macro): {metrics_test['activity_f1_macro']:.3f} | "
+-            f"Act F1 (weighted): {metrics_test['activity_f1_weighted']:.3f} | "
+-            f"activity_accuracy: {metrics_test['activity_accuracy']:.3f} | "
++        # calculate the accuracy between 0 and 1
++        accuracy_d_false = (accurate_preds_d_false * 1.0) / (len(predictions_d_false) * batch_size)
+ 
+-    )
+-"""        
+-    print(
+-            f"Act F1 (macro): {metrics_train['activity_f1_macro']:.3f} | "
+-            f"Act F1 (weighted): {metrics_train['activity_f1_weighted']:.3f} | "
+-            f"activity_accuracy: {metrics_train['activity_accuracy']:.3f} | "
+-            f"domain_accuracy: {metrics_train['domain_accuracy']:.3f} | "
+-            f"Domain F1 (weighted): {metrics_train['domain_f1_macro']:.3f}"
++        # compute the number of accurate predictions
++        accurate_preds_y = 0
++        accurate_preds_y_false = 0
++
++        for pred, act in zip(predictions_y, actuals_y):
++            _, num_pred = pred.max(1)
++            v = torch.sum(num_pred == act)
++            accurate_preds_y += v
++
++        accuracy_y = (accurate_preds_y * 1.0) / (len(predictions_y) * batch_size)
++
++
++        for pred, act in zip(predictions_y_false, actuals_y):
++            _, num_pred = pred.max(1)
++            v = torch.sum(num_pred == act)
++            accurate_preds_y_false += v
++        # calculate the accuracy between 0 and 1
++        accuracy_y_false = (accurate_preds_y_false * 1.0) / (len(predictions_y_false) * batch_size)
++          # domain macro F1
++        d_true = torch.cat(actuals_d).cpu().numpy()
++        d_pred = torch.cat([p.argmax(1) for p in predictions_d]).cpu().numpy()
++        d_macro_f1 = f1_score(d_true, d_pred, average="macro")
+ 
+-    )"""
+\ No newline at end of file
++        # activity macro F1
++        y_true = torch.cat(actuals_y).cpu().numpy()
++        y_pred = torch.cat([p.argmax(1) for p in predictions_y]).cpu().numpy()
++        y_macro_f1 = f1_score(y_true, y_pred, average="macro")
++
++        return accuracy_d, accuracy_y, accuracy_d_false, accuracy_y_false, d_macro_f1, y_macro_f1
++
++
++
++# training
++torch.manual_seed(10)
++for epoch in range(100):
++    avg_epoch_loss, avg_epoch_class_y_loss = train_one_epoch(train_loaders)
++    train_acc_d, train_acc_y, train_acc_d_false, train_acc_y_false, _,_ = get_accuracy(train_loaders, device, model, model.classifier, 64)
++    test_acc_d, test_acc_y, test_acc_d_false, test_acc_y_false, _, y_macro_f1 = get_accuracy([test_loader], device, model, model.classifier, 64)
++    print(
++        f"Epoch {epoch:03d} | "
++        f"Loss main: {avg_epoch_loss:8.3f} | "
++        f"Loss ie: {avg_epoch_class_y_loss:8.3f} | "
++        f"Train ActAcc: {train_acc_y:5.3f} | "
++        f"Train DomAcc: {train_acc_d:5.3f} | "
++        f"Train FalseAct: {train_acc_y_false:5.3f} | "
++        f"Train FalseDom: {train_acc_d_false:5.3f} | "
++        f"Test ActAcc: {test_acc_y:5.3f} | "
++        f"Test DomAcc: {test_acc_d:5.3f} | "
++        f"Test F1 MacroAct: {y_macro_f1:5.3f}"
++    )
+\ No newline at end of file
+diff --git a/model_GLIE.py b/model_GLIE.py
+index 2c32fe5..218aa03 100644
+--- a/model_GLIE.py
++++ b/model_GLIE.py
+@@ -6,6 +6,7 @@ import torch.distributions as dist
+ from typing import Tuple
+ from utils import GradReverse
+ from typing import Tuple, List, Optional
++import torch.distributions as dist
+ 
+ class DomainPrior(nn.Module):
+     """
+@@ -13,21 +14,21 @@ class DomainPrior(nn.Module):
+     Conditional Gaussian prior for domain latent variable z_d.
+     """
+ 
+-    def __init__(self, num_domains: int, latent_dim: int):
++    def __init__(self, d_dim, x_dim, y_dim, zd_dim, zx_dim, zy_dim):
+         super().__init__()
+ 
+-        self.num_domains = num_domains
+-        self.latent_dim = latent_dim
+-
++        self.d_dim = d_dim
++        self.latent_dim = zd_dim
++        self.num_domains = 4
+         self.backbone = nn.Sequential(
+-            nn.Linear(num_domains, latent_dim, bias=False),
+-            nn.BatchNorm1d(latent_dim),
++            nn.Linear(d_dim, zd_dim, bias=False),
++            nn.BatchNorm1d(zd_dim),
+             nn.ReLU(),
+         )
+ 
+-        self.mu_head = nn.Linear(latent_dim, latent_dim)
++        self.mu_head = nn.Linear(zd_dim, zd_dim)
+         self.scale_head = nn.Sequential(
+-            nn.Linear(latent_dim, latent_dim),
++            nn.Linear(zd_dim, zd_dim),
+             nn.Softplus()
+         )
+ 
+@@ -64,21 +65,21 @@ class ClassPrior(nn.Module):
+     Conditional Gaussian prior for class/activity latent variable z_y.
+     """
+ 
+-    def __init__(self, num_classes: int, latent_dim: int):
++    def __init__(self, d_dim, x_dim, y_dim, zd_dim, zx_dim, zy_dim):
+         super().__init__()
+ 
+-        self.num_classes = num_classes
+-        self.latent_dim = latent_dim
++        self.num_classes = y_dim
++        self.latent_dim = zy_dim
+ 
+         self.backbone = nn.Sequential(
+-            nn.Linear(num_classes, latent_dim, bias=False),
+-            nn.BatchNorm1d(latent_dim),
++            nn.Linear(y_dim, zy_dim, bias=False),
++            nn.BatchNorm1d(zy_dim),
+             nn.ReLU(),
+         )
+ 
+-        self.mu_head = nn.Linear(latent_dim, latent_dim)
++        self.mu_head = nn.Linear(zy_dim, zy_dim)
+         self.scale_head = nn.Sequential(
+-            nn.Linear(latent_dim, latent_dim),
++            nn.Linear(zy_dim, zy_dim),
+             nn.Softplus()
+         )
+ 
+@@ -115,18 +116,13 @@ class QZD(nn.Module):
+     Domain-specific latent encoder
+     """
+ 
+-    def __init__(
+-        self,
+-        *,
+-        n_features: int,
+-        latent_dim: int,
+-    ) -> None:
++    def __init__(self, d_dim, x_dim, y_dim, zd_dim, zx_dim, zy_dim):
+         super().__init__()
+ 
+-        self.n_features = n_features
++        self.n_features = 77
+ 
+         # Convolutional backbone 
+-        self.conv1 = nn.Conv2d(n_features, 1024, kernel_size=(1, 5))
++        self.conv1 = nn.Conv2d(self.n_features, 1024, kernel_size=(1, 5))
+         self.conv2 = nn.Conv2d(1024, 512, kernel_size=(1, 1))
+         self.conv3 = nn.Conv2d(512, 128, kernel_size=(1, 1))
+         self.conv4 = nn.Conv2d(128, 64, kernel_size=(1, 1))
+@@ -137,16 +133,25 @@ class QZD(nn.Module):
+         self.pool2 = nn.MaxPool2d((1, 2), stride=2, return_indices=True, ceil_mode=True)
+         self.pool3 = nn.MaxPool2d((1, 2), stride=2, return_indices=True, ceil_mode=True)
+         self.pool4 = nn.MaxPool2d((1, 2), stride=2, return_indices=True, ceil_mode=True)
++        #zd_dim = num domains
++        self.fc11 = nn.Sequential(nn.Linear(128, zd_dim))
++        self.fc12 = nn.Sequential(nn.Linear(128, zd_dim), nn.Softplus())
+ 
+         #  Latent heads 
+-        self.fc_mu = nn.Linear(128, latent_dim)
++        self.fc_mu = nn.Linear(128, zd_dim)
+         self.fc_sigma = nn.Sequential(
+-            nn.Linear(128, latent_dim),
++            nn.Linear(128, zd_dim),
+             nn.Softplus()
+         )
++        
++        torch.nn.init.xavier_uniform_(self.fc11[0].weight)
++        self.fc11[0].bias.data.zero_()
++        torch.nn.init.xavier_uniform_(self.fc12[0].weight)
++        self.fc12[0].bias.data.zero_()
+ 
+         self._init_weights()
+ 
++
+     def _init_weights(self) -> None:
+         for m in self.modules():
+             if isinstance(m, (nn.Conv2d, nn.Linear)):
+@@ -154,53 +159,33 @@ class QZD(nn.Module):
+                 if m.bias is not None:
+                     nn.init.zeros_(m.bias)
+ 
+-    def forward(
+-        self, x: torch.Tensor
+-    ) -> Tuple[torch.Tensor, torch.Tensor, Tuple]:
+-        """
+-        Args:
+-            x: Tensor [B, C, 1, T]
+-
+-        Returns:
+-            mu:    [B, latent_dim]
+-            sigma: [B, latent_dim]
+-            pool_indices: indices for unpooling in decoder
+-        """
+-        x = x.float()
+-
+-        # Accept [B, T*F], [B, T, F], or [B, 1, T, F]
+-        if x.dim() == 2:
+-            # [B, T*F] → [B, T, F]
+-            B = x.size(0)
+-            x = x.view(B, -1, self.n_features)
+-
+-        if x.dim() == 3:
+-            # [B, T, F] → [B, F, 1, T]
+-            x = x.permute(0, 2, 1).unsqueeze(2)
+ 
+-        if x.dim() != 4:
+-            raise RuntimeError(f"Unexpected input shape to QZD: {x.shape}")
+-        x = self.relu(self.conv1(x))
+-        x, idx1 = self.pool1(x)
++    def forward(self, x):
++        x_img = x.float()
++        x_img = x_img.view(-1, x_img.shape[3], 1, x_img.shape[2])
+ 
+-        x = self.relu(self.conv2(x))
+-        x, idx2 = self.pool2(x)
++        out_conv1 = self.conv1(x_img)
++        out1, idx1 = self.pool1(out_conv1)
+ 
+-        x = self.relu(self.conv3(x))
+-        x, idx3 = self.pool3(x)
++        out_conv2 = self.conv2(out1)
++        out2, idx2 = self.pool2(out_conv2)
+ 
+-        x = self.relu(self.conv4(x))
+-        x, idx4 = self.pool4(x)
++        out_conv3 = self.conv3(out2)
++        out3, idx3 = self.pool3(out_conv3)
+ 
+-        # flatten (batch, channels, 1, time) → (batch, features)
+-        x = x.flatten(start_dim=1)
++        out_conv4 = self.conv4(out3)
++        out4, idx4 = self.pool4(out_conv4)
+ 
+-        mu = self.fc_mu(x)
+-        sigma = self.fc_sigma(x)
++        out = out4.reshape(-1, out4.shape[1] * out4.shape[3])
++        size1 = out1.size()
++        size2 = out2.size()
++        size3 = out3.size()
++        size4 = out4.size()
+ 
+-        pool_indices = (idx1, idx2, idx3, idx4)
++        zd_loc = self.fc11(out)
++        zd_scale = self.fc12(out) + 1e-7
+ 
+-        return mu, sigma, pool_indices, None
++        return zd_loc, zd_scale, [idx1, idx2, idx3, idx4], [size1, size2, size3, size4]
+     
+ class QZY(nn.Module):
+     """
+@@ -208,17 +193,12 @@ class QZY(nn.Module):
+     Activity-specific latent encoder
+     """
+ 
+-    def __init__(
+-        self,
+-        *,
+-        n_features: int,
+-        latent_dim: int,
+-    ) -> None:
++    def __init__(self, d_dim, x_dim, y_dim, zd_dim, zx_dim, zy_dim):
+         super().__init__()
+-        self.n_features = n_features
++        self.n_features = 77
+ 
+         # Convolutional backbone 
+-        self.conv1 = nn.Conv2d(n_features, 1024, kernel_size=(1, 5))
++        self.conv1 = nn.Conv2d(self.n_features, 1024, kernel_size=(1, 5))
+         self.conv2 = nn.Conv2d(1024, 512, kernel_size=(1, 1))
+         self.conv3 = nn.Conv2d(512, 128, kernel_size=(1, 1))
+         self.conv4 = nn.Conv2d(128, 64, kernel_size=(1, 1))
+@@ -229,118 +209,20 @@ class QZY(nn.Module):
+         self.pool2 = nn.MaxPool2d((1, 2), stride=2, return_indices=True, ceil_mode=True)
+         self.pool3 = nn.MaxPool2d((1, 2), stride=2, return_indices=True, ceil_mode=True)
+         self.pool4 = nn.MaxPool2d((1, 2), stride=2, return_indices=True, ceil_mode=True)
+-
++        # zy_dim = d_AE
++        self.fc11 = nn.Sequential(nn.Linear(128, 50))
++        self.fc12 = nn.Sequential(nn.Linear(128, 50), nn.Softplus())
+         # Latent heads 
+-        self.fc_mu = nn.Linear(128, latent_dim)
+-        self.fc_sigma = nn.Sequential(
+-            nn.Linear(128, latent_dim),
++        self.fc_mu = nn.Linear(128, zy_dim)
++        self.fc_sigma = nn.Sequential(nn.Linear(128, zy_dim),
+             nn.Softplus()
+         )
+ 
+-        self._init_weights()
+-
+-    def _init_weights(self) -> None:
+-        for m in self.modules():
+-            if isinstance(m, (nn.Conv2d, nn.Linear)):
+-                nn.init.xavier_uniform_(m.weight)
+-                if m.bias is not None:
+-                    nn.init.zeros_(m.bias)
+-
+-    def forward(
+-        self, x: torch.Tensor
+-    ) -> Tuple[
+-        torch.Tensor,
+-        torch.Tensor,
+-        List[torch.Tensor],
+-        List[torch.Size],
+-    ]:
+-        """
+-        Args:
+-            x: Tensor of shape [B, 1, T, F] or equivalent
+-
+-        Returns:
+-            mu:            [B, latent_dim]
+-            sigma:         [B, latent_dim]
+-            pool_indices:  list of pooling indices
+-            pool_sizes:    list of tensor sizes before pooling
+-        """
+-
+-        x = x.float()
+-
+-        if x.dim() == 2:
+-            # [B, T*F] -> [B, T, F]
+-            B = x.size(0)
+-            x = x.view(B, -1, self.n_features)
+-
+-        if x.dim() == 3:
+-            # [B, T, F] -> [B, F, 1, T]
+-            x = x.permute(0, 2, 1).unsqueeze(2)
+-
+-        if x.dim() != 4:
+-            raise RuntimeError(f"Unexpected input shape to QZY: {x.shape}")
+-
+-        x = self.relu(self.conv1(x))
+-        x, idx1 = self.pool1(x)
+-        size1 = x.size()
+-
+-        x = self.relu(self.conv2(x))
+-        x, idx2 = self.pool2(x)
+-        size2 = x.size()
+-
+-        x = self.relu(self.conv3(x))
+-        x, idx3 = self.pool3(x)
+-        size3 = x.size()
+-
+-        x = self.relu(self.conv4(x))
+-        x, idx4 = self.pool4(x)
+-        size4 = x.size()
+-
+-        # flatten for latent heads
+-        x = x.flatten(start_dim=1)
+-
+-        mu = self.fc_mu(x)
+-        sigma = self.fc_sigma(x) + 1e-7
+-
+-        pool_indices = [idx1, idx2, idx3, idx4]
+-        pool_sizes = [size1, size2, size3, size4]
+-
+-        return mu, sigma, pool_indices, pool_sizes
+-
+-class QZX(nn.Module):
+-    """
+-    q(z_x | x)
+-    Content-specific latent encoder
+-    """
+-
+-    def __init__(
+-        self,
+-        *,
+-        n_features: int,
+-        latent_dim: int,
+-    ) -> None:
+-        super().__init__()
+-
+-        self.n_features = n_features
+-
+-        # Convolutional backbone
+-        self.conv1 = nn.Conv2d(n_features, 1024, kernel_size=(1, 5))
+-        self.conv2 = nn.Conv2d(1024, 512, kernel_size=(1, 1))
+-        self.conv3 = nn.Conv2d(512, 128, kernel_size=(1, 1))
+-        self.conv4 = nn.Conv2d(128, 64, kernel_size=(1, 1))
+-
+-        self.relu = nn.ReLU(inplace=True)
+-
+-        self.pool1 = nn.MaxPool2d((1, 2), stride=2, return_indices=True, ceil_mode=True)
+-        self.pool2 = nn.MaxPool2d((1, 2), stride=2, return_indices=True, ceil_mode=True)
+-        self.pool3 = nn.MaxPool2d((1, 2), stride=2, return_indices=True, ceil_mode=True)
+-        self.pool4 = nn.MaxPool2d((1, 2), stride=2, return_indices=True, ceil_mode=True)
++        torch.nn.init.xavier_uniform_(self.fc11[0].weight)
++        self.fc11[0].bias.data.zero_()
++        torch.nn.init.xavier_uniform_(self.fc12[0].weight)
++        self.fc12[0].bias.data.zero_()
+ 
+-        # Latent heads
+-        self.fc_mu = nn.Linear(128, latent_dim)
+-        self.fc_sigma = nn.Sequential(
+-            nn.Linear(128, latent_dim),
+-            nn.Softplus()
+-        )
+ 
+         self._init_weights()
+ 
+@@ -351,54 +233,34 @@ class QZX(nn.Module):
+                 if m.bias is not None:
+                     nn.init.zeros_(m.bias)
+ 
+-    def forward(
+-        self, x: torch.Tensor
+-    ) -> Tuple[torch.Tensor, torch.Tensor, Tuple]:
+-        """
+-        Args:
+-            x: Tensor [B, C, 1, T] or [B, T, F] or [B, T*F]
+-
+-        Returns:
+-            mu:    [B, latent_dim]
+-            sigma: [B, latent_dim]
+-            pool_indices: for unpooling in decoder
+-        """
+-        x = x.float()
+-
+-        # Accept [B, T*F], [B, T, F], or [B, 1, T, F]
+-        if x.dim() == 2:
+-            B = x.size(0)
+-            x = x.view(B, -1, self.n_features)
+-
+-        if x.dim() == 3:
+-            x = x.permute(0, 2, 1).unsqueeze(2)
+ 
+-        if x.dim() != 4:
+-            raise RuntimeError(f"Unexpected input shape to QZX: {x.shape}")
++    def forward(self, x):
+ 
+-        x = self.relu(self.conv1(x))
+-        x, idx1 = self.pool1(x)
++        x_img = x.float()
++        x_img = x_img.view(-1, x_img.shape[3], 1, x_img.shape[2])
+ 
+-        x = self.relu(self.conv2(x))
+-        x, idx2 = self.pool2(x)
++        out_conv1 = self.conv1(x_img)
++        out1, idx1 = self.pool1(out_conv1)
+ 
+-        x = self.relu(self.conv3(x))
+-        x, idx3 = self.pool3(x)
++        out_conv2 = self.conv2(out1)
++        out2, idx2 = self.pool2(out_conv2)
+ 
+-        x = self.relu(self.conv4(x))
+-        x, idx4 = self.pool4(x)
++        out_conv3 = self.conv3(out2)
++        out3, idx3 = self.pool3(out_conv3)
+ 
+-        # (B, C, 1, T) -> (B, features)
+-        x = x.flatten(start_dim=1)
++        out_conv4 = self.conv4(out3)
++        out4, idx4 = self.pool4(out_conv4)
+ 
+-        mu = self.fc_mu(x)
+-        sigma = self.fc_sigma(x) + 1e-7
++        out = out4.reshape(-1, out4.shape[1] * out4.shape[3]) # [64, 512]
++        size1 = out1.size()
++        size2 = out2.size()
++        size3 = out3.size()
++        size4 = out4.size()
+ 
+-        pool_indices = (idx1, idx2, idx3, idx4)
++        zy_loc = self.fc11(out)
++        zy_scale = self.fc12(out) + 1e-7
+ 
+-        return mu, sigma, pool_indices, None
+-    
+-    
++        return zy_loc, zy_scale, [idx1, idx2, idx3, idx4], [size1, size2, size3, size4]
+ 
+ class PX(nn.Module):
+     """
+@@ -407,20 +269,12 @@ class PX(nn.Module):
+     Decoder using unpooling + transposed convolutions.
+     """
+ 
+-    def __init__(
+-        self,
+-        *,
+-        n_features: int,
+-        latent_dim_domain: int,
+-        latent_dim_activity: int,
+-        latent_dim_shared: int = 0,
+-    ) -> None:
++    def __init__(self, d_dim, x_dim, y_dim, zd_dim, zx_dim, zy_dim):
+         super().__init__()
+ 
+-        self.n_features = n_features
+-        self.latent_dim_shared = latent_dim_shared
++        self.n_features = 77
+ 
+-        total_latent_dim = latent_dim_domain + latent_dim_activity + latent_dim_shared
++        total_latent_dim = zd_dim + zx_dim + zy_dim
+ 
+         #  Latent projection 
+         self.fc = nn.Sequential(
+@@ -451,7 +305,7 @@ class PX(nn.Module):
+         self.unpool4 = nn.MaxUnpool2d((1, 2), stride=2)
+         self.deconv4 = nn.Sequential(
+             nn.ConvTranspose2d(
+-                1024, n_features, kernel_size=(1, 5)
++                1024, self.n_features, kernel_size=(1, 5)
+             ),
+             nn.ReLU(inplace=True),
+         )
+@@ -486,12 +340,12 @@ class PX(nn.Module):
+         """
+ 
+         #  Concatenate latents 
+-        if self.latent_dim_shared > 0:
++        """        if self.latent_dim_shared > 0:
+             if z_shared is None:
+                 raise ValueError("z_shared must be provided when latent_dim_shared > 0")
+             z = torch.cat([z_domain, z_shared, z_activity], dim=1)
+-        else:
+-            z = torch.cat([z_domain, z_activity], dim=1)
++        else:"""
++        z = torch.cat([z_domain, z_activity], dim=1)
+ 
+         #  Project to conv feature map 
+         h = self.fc(z)
+@@ -516,14 +370,21 @@ class PX(nn.Module):
+ 
+ 
+ 
+-class LatentClassifier(nn.Module):
+-    def __init__(self, latent_dim, num_classes):
++class QD(nn.Module):
++    def __init__(self, d_dim, x_dim, y_dim, zd_dim, zx_dim, zy_dim):
+         super().__init__()
+-        self.fc = nn.Linear(latent_dim, num_classes)
++        self.fc = nn.Linear(zd_dim, d_dim)
+ 
+     def forward(self, z):
+         return self.fc(z)
++    
++class QY(nn.Module):
++    def __init__(self, d_dim, x_dim, y_dim, zd_dim, zx_dim, zy_dim):
++        super().__init__()
++        self.fc = nn.Linear(zy_dim, y_dim)
+ 
++    def forward(self, z):
++        return self.fc(z)
+ 
+ class GILE(nn.Module):
+     def __init__(
+@@ -532,187 +393,188 @@ class GILE(nn.Module):
+         activity_classes,
+         domain_classes,
+         latent_dim=32,
+-        beta_domain=0.002,
+-        beta_activity=10,
+-        beta_rest=0.1,
+-        aux_loss_multiplier_y = 1000,
+-        aux_loss_multiplier_d = 1000,
+-        weight_true =1000,
+-        weight_false=1000,
+-        zx_dim =0,     ):
++        beta_domain=1.0,
++        beta_activity=1.0,
++    ):
+         super().__init__()
+-
+-        self.zx_dim = zx_dim
+-
++        self.aux_loss_multiplier_d =1000
++        self.aux_loss_multiplier_y =1000
++        self.weight_true = 1000
++        self.weight_false = 1000
++        self.beta_d = 0.002
++        self.beta_y = 10
++
++        self.zd_dim = 50 #d_AE
++        self.zx_dim = 0
++        self.zy_dim = 50 #d_AE
++        self.d_dim = 4 #n_domains
++        self.x_dim = 0
++        self.y_dim = 18 #class
+         # Encoders
+-        self.activity_encoder = QZY(n_features=77, latent_dim=latent_dim, )
+-        self.domain_encoder = QZD(n_features=77, latent_dim=latent_dim,)
++        self.activity_encoder = QZY(self.d_dim, self.x_dim, self.y_dim, self.zd_dim, self.zx_dim, self.zy_dim) #qzy
++        self.domain_encoder = QZD(self.d_dim, self.x_dim, self.y_dim, self.zd_dim, self.zx_dim, self.zy_dim) # qzd
+ 
+-        if self.zx_dim != 0:
+-            self.qzx = QZX(n_features=77, latent_dim=latent_dim,)
+         # Priors
+-        self.activity_prior = ClassPrior(activity_classes, latent_dim)
+-        self.domain_prior = DomainPrior(domain_classes, latent_dim)
++        self.activity_prior = ClassPrior(self.d_dim, self.x_dim, self.y_dim, self.zd_dim, self.zx_dim, self.zy_dim) #pzy
++        self.domain_prior = DomainPrior(self.d_dim, self.x_dim, self.y_dim, self.zd_dim, self.zx_dim, self.zy_dim) #pzd
+ 
+         # Decoder
+-        self.decoder = PX(n_features=77, latent_dim_domain=latent_dim, latent_dim_activity=latent_dim,)
++        self.decoder = PX(self.d_dim, self.x_dim, self.y_dim, self.zd_dim, self.zx_dim, self.zy_dim) #
+ 
+         # Disentangling classifiers
+-        self.activity_classifier = LatentClassifier(latent_dim, activity_classes)   # z_y -> y
+-        self.domain_classifier   = LatentClassifier(latent_dim, domain_classes)     # z_d -> d
++        self.activity_classifier = QY(self.d_dim, self.x_dim, self.y_dim, self.zd_dim, self.zx_dim, self.zy_dim) # qy
++        self.domain_classifier = QD(self.d_dim, self.x_dim, self.y_dim, self.zd_dim, self.zx_dim, self.zy_dim) # qd
+ 
+         # KL weights
+-        self.beta_d  = beta_domain
+-        self.beta_y  = beta_activity
+-        self.beta_x = beta_rest
+-        self.aux_loss_multiplier_d =aux_loss_multiplier_d
+-        self.aux_loss_multiplier_y =aux_loss_multiplier_y
+-
+-        self.weight_true = weight_true
+-        self.weight_false = weight_false
++        self.beta_activity = beta_activity
++        self.beta_domain = beta_domain
+ 
+     def forward(self, x, y, d):
+-        #q_loc. q_scale
+-        mu_a, sigma_a, pool_idx_a, pool_sizes_a = self.activity_encoder(x)
+-        mu_d, sigma_d, _, _ = self.domain_encoder(x)
+-        
+-        if self.zx_dim != 0:
+-            zx_q_loc, zx_q_scale, _, _ = self.qzx(x)
+-        
+-        if self.zx_dim != 0:
+-            qzx = dist.Normal(zx_q_loc, zx_q_scale)
+-            zx_q = qzx.rsample()
+-        else:
+-            qzx = None
+-            zx_q = None
++        x = torch.unsqueeze(x, 1)
++        d = d.long().view(-1)   # or d = d.squeeze(-1)
++        y = y.long().view(-1)   # or y = y.squeeze(-1)
+ 
+-        qzd = dist.Normal(mu_d, sigma_d)
++        #encode
++        mu_y, sigma_y, pool_idx_y, pool_sizes_y = self.activity_encoder(x)
++        mu_d, sigma_d, _, _ = self.domain_encoder(x)
+ 
+-        qzy = dist.Normal(mu_a, sigma_a)
+-        
+         # reparameterization
+-        zy_q = qzy.rsample()
+-        zd_q = qzd.rsample()        
++        qzd = dist.Normal(mu_d,sigma_d)
++        qzy = dist.Normal(mu_y,sigma_y)
+ 
++        zy_q = qzy.rsample()
++        zd_q = qzd.rsample()
+ 
+         # decode
++
+         x_recon = self.decoder(
+             z_domain=zd_q,
+             z_activity=zy_q,
+-            pool_indices=pool_idx_a,   # or whichever path you reconstruct from
+-            pool_sizes=pool_sizes_a,
+-            z_shared = zx_q,
++            pool_indices=pool_idx_y,   
++            pool_sizes=pool_sizes_y,
+         )
+-
+-        zy_p_loc, zy_p_scale = self.activity_prior(y)
++        #priors
+         zd_p_loc, zd_p_scale = self.domain_prior(d)
+-        
+-        if self.zx_dim != 0:
+-            zx_p_loc, zx_p_scale = torch.zeros(zd_p_loc.size()[0], self.zx_dim).cuda(),\
+-                                   torch.ones(zd_p_loc.size()[0], self.zx_dim).cuda()
++        zy_p_loc, zy_p_scale = self.activity_prior(y)
+ 
+-        # Reparameterization trick
++        #reparameterization
+         pzd = dist.Normal(zd_p_loc, zd_p_scale)
+         pzy = dist.Normal(zy_p_loc, zy_p_scale)
+ 
+-        if self.zx_dim != 0:
+-            pzx = dist.Normal(zx_p_loc, zx_p_scale)
+-        else:
+-            pzx = None
+-        # Auxiliary losses
+         y_hat  = self.activity_classifier(zy_q)
+         d_hat  = self.domain_classifier(zd_q)
+ 
+-        y_cross  = self.activity_classifier(zd_q)
+-        d_cross  = self.domain_classifier(zy_q)
+-
+-        return {
+-            "x_recon": x_recon,
+-            "d_hat": d_hat,
+-            "y_hat": y_hat,
+-            "qzx" : qzx,
+-            "pzx" : pzx,
+-            "zx_q" : zx_q,
+-            "qzd": qzd,
+-            "pzd": pzd,
+-            "zd_q": zd_q,
+-            "qzy": qzy,
+-            "pzy": pzy,
+-            "zy_q": zy_q,
+-            "y_cross":y_cross,
+-            "d_cross":d_cross
+-
+-        }
++        return x_recon, d_hat, y_hat, qzd, pzd, zd_q, _,_,_, qzy, pzy, zy_q
++
+     
+   
+-    def loss_function_elbo(self, x, y, d, pred):
+-        d = d.long()
+-        y = y.long()
++    def compute_loss( self, x, y, d ):
++        
++        d = d.long().view(-1)
++        y = y.long().view(-1)
++        x_recon, d_hat, y_hat, qzd, pzd, zd_q, qzx, pzx, zx_q, qzy, pzy, zy_q = self.forward(x,y,d)
++        x = torch.unsqueeze(x, 1)
+ 
+-        #pred = self.forward(x,y,d)
++        CE_x = F.mse_loss(x_recon, x.float())
++        zd_p_minus_zd_q = torch.sum(pzd.log_prob(zd_q) - qzd.log_prob(zd_q))
+         
+-        B = x.size(0)
+-        x_recon  = pred["x_recon"].reshape(B, -1)
+-        x_target = x.reshape(B, -1)
+-        CE_x  = F.mse_loss(x_recon, x_target, reduction="mean")
++        zy_p_minus_zy_q = torch.sum(pzy.log_prob(zy_q) - qzy.log_prob(zy_q))
++        CE_d = F.cross_entropy(d_hat, d, reduction='sum')
++        CE_y = F.cross_entropy(y_hat, y, reduction='sum')
+ 
+-        zd_p_minus_zd_q = torch.sum(pred["pzd"].log_prob(pred["zd_q"]) - pred["qzd"].log_prob(pred["zd_q"]))
+-        zy_p_minus_zy_q = torch.sum(pred["pzy"].log_prob(pred["zy_q"]) - pred["qzy"].log_prob(pred["zy_q"]))
++        return CE_x \
++               - self.beta_d * zd_p_minus_zd_q \
++               - self.beta_y * zy_p_minus_zy_q \
++               + self.aux_loss_multiplier_d * CE_d \
++               + self.aux_loss_multiplier_y * CE_y,\
++               CE_y
+ 
+-        #CE_d = F.cross_entropy(pred["d_hat"], d, reduction='mean')
+-        #CE_y = F.cross_entropy(pred["y_hat"], y, reduction='mean')
+-        
+-        if self.zx_dim != 0:
+-            KL_zx = torch.sum(pred["pzx"].log_prob(pred["zx_q"]) - pred["qzx"].log_prob(pred["zx_q"]))
+-        else:
+-            KL_zx = 0          
+-        return  CE_x - self.beta_d * zd_p_minus_zd_q - self.beta_x * KL_zx - self.beta_y * zy_p_minus_zy_q
+- 
+-    
+-    def loss_function_dc(self, x, y, d, pred):
+-        CE_d = F.cross_entropy(pred["d_hat"], d, reduction='mean')
+-        CE_y = F.cross_entropy(pred["y_hat"], y, reduction='mean')
+ 
+-        return self.aux_loss_multiplier_d * CE_d + self.aux_loss_multiplier_y * CE_y
+ 
+-    def loss_function_ie(self, x, y, d, pred):
++    def compute_loss_false(
++        self,
++        x,
++        y,
++        d,
++        
++    ):
++        """
++        IE / false step (optimizer_ie):
++        train ONLY the IE heads to be good at predicting the wrong thing.
++        -> detach latents so encoders dont move in this step
++        """
+         d = d.long()
+         y = y.long()
+ 
+-        # use logits already computed in forward (best)
+-        loss_false = (
+-            F.cross_entropy(pred["d_cross"], d, reduction="mean") +
+-            F.cross_entropy(pred["y_cross"], y, reduction="mean")
+-        )
+-        return -self.weight_false * loss_false
++        pred_d, pred_y, pred_d_false, pred_y_false = self.classifier(x)
+ 
+-    
+-    @torch.no_grad()
+-    def classify_no_inf(self,x):
+-        return self.classify(x)
++        loss_classify_true = self.weight_true * (F.cross_entropy(pred_d, d, reduction='sum') + F.cross_entropy(pred_y, y, reduction='sum'))
++        loss_classify_false = self.weight_false * (F.cross_entropy(pred_d_false, d, reduction='sum') + F.cross_entropy(pred_y_false, y, reduction='sum'))
++
++        loss = loss_classify_true - loss_classify_false
+ 
+-    def classify(self, x):
+-        # encode
+-        zy_loc, _, _, _ = self.activity_encoder(x)
+-        zd_loc, _, _, _ = self.domain_encoder(x)
++        loss.requires_grad = True
++
++        return loss
++
++    def classifier(self, x):
++        """
++        classify an image (or a batch of images)
++        :param xs: a batch of scaled vectors of pixels from an image
++        :return: a batch of the corresponding class labels (as one-hots)
++        """
++        with torch.no_grad():
+ 
+-        zy = zy_loc
+-        zd = zd_loc
++            x = torch.unsqueeze(x, 1)
+ 
+-        # logits (NOT one-hot)
+-        d_hat   = self.domain_classifier(zd)   # z_d -> d
+-        y_hat   = self.activity_classifier(zy) # z_y -> y
+-        d_false = self.domain_classifier(zy)   # z_y -> d
+-        y_false = self.activity_classifier(zd) # z_d -> y
++            zd_q_loc, zd_q_scale, _, _ = self.domain_encoder(x)
++            zd = zd_q_loc
++            alpha = F.softmax(self.domain_classifier(zd), dim=1)
+ 
+-        return d_hat, y_hat, d_false, y_false
++            # get the index (digit) that corresponds to
++            # the maximum predicted class probability
++            res, ind = torch.topk(alpha, 1)
+ 
++            # convert the digit(s) to one-hot tensor(s)
++            d = x.new_zeros(alpha.size())
++            d = d.scatter_(1, ind, 1.0)
+ 
++            zy_q_loc, zy_q_scale, _, _ = self.activity_encoder.forward(x)
++            zy = zy_q_loc
++            alpha = F.softmax(self.activity_classifier(zy), dim=1)
+ 
++            # get the index (digit) that corresponds to
++            # the maximum predicted class probability
++            res, ind = torch.topk(alpha, 1)
+ 
++            # convert the digit(s) to one-hot tensor(s)
++            y = x.new_zeros(alpha.size())
++            y = y.scatter_(1, ind, 1.0)
++
++            alpha_y2d = F.softmax(self.domain_classifier(zy), dim=1)
++
++            # get the index (digit) that corresponds to
++            # the maximum predicted class probability
++            res, ind = torch.topk(alpha_y2d, 1)
++            # convert the digit(s) to one-hot tensor(s)
++            d_false = x.new_zeros(alpha_y2d.size())
++            d_false = d_false.scatter_(1, ind, 1.0)
++
++            alpha_d2y = F.softmax(self.activity_classifier(zd), dim=1)
++
++            # get the index (digit) that corresponds to
++            # the maximum predicted class probability
++            res, ind = torch.topk(alpha_d2y, 1)
++
++            # convert the digit(s) to one-hot tensor(s)
++            y_false = x.new_zeros(alpha_d2y.size())
++            y_false = y_false.scatter_(1, ind, 1.0)
++
++        return d, y, d_false, y_false
++    
+ def kl_divergence(logvar_q, logvar_p, mu_q, mu_p):
+     # returns mean KL over batch
+     var_q = torch.exp(logvar_q)
+     var_p = torch.exp(logvar_p)
+     kl = 0.5 * (logvar_p - logvar_q + (var_q + (mu_q - mu_p)**2) / var_p - 1.0)
+-    return kl.sum(dim=1).mean()
++    return kl.sum(dim=1).mean()
+\ No newline at end of file
+diff --git a/oppor_dataloader_v2.py b/oppor_dataloader_v2.py
+index 4333459..dee449f 100644
+--- a/oppor_dataloader_v2.py
++++ b/oppor_dataloader_v2.py
+@@ -1,221 +1,141 @@
+ from __future__ import annotations
+ 
+ import os
+-import pickle
+-import re
+-from pathlib import Path
+-from typing import List, Sequence, Tuple, Optional, Literal
+ 
+ import numpy as np
+ import torch
+ from torch.utils.data import Dataset, DataLoader, WeightedRandomSampler
+ 
+-from utils import opp_sliding_window_w_d  # last-label windowing
+-
+-
+-LabelType = Literal["gestures", "locomotion"]
+-
+-NUM_FEATURES = 77
+-PREPROCESSED_ROOT = Path(os.getenv("OPP_PREPROCESSED_ROOT", "./data/oppor_preprocessed/"))
+-
+-
+-def _domain_id_to_int(domain_id: str) -> int:
+-    m = re.search(r"(\d+)$", domain_id)
+-    if not m:
+-        raise ValueError(f"cannot parse numeric suffix from domain_id={domain_id!r}")
+-    return int(m.group(1)) - 1  # S1->0, ...
+-
+-
+-def _expected_num_classes(label_type: LabelType) -> int:
+-    # OPPORTUNITY: gestures are typically 18 classes (including 0 = "null"),
+-    # locomotion is usually 5 (or 4/5 depending on mapping). Your setup uses 18.
+-    return 18 if label_type == "gestures" else 5
+-
+-
+-def _preprocessed_candidates(domain_id: str, label_type: LabelType) -> List[Path]:
+-    # Make label_type explicit in filenames to avoid accidentally loading the wrong task.
+-    # Preferred:
+-    #   oppor_domain_S1_gestures_wd.data
+-    #   oppor_domain_S1_locomotion_wd.data
+-    #
+-    # Fallbacks (less explicit) are still supported, but we validate label ranges later.
+-    return [
+-        PREPROCESSED_ROOT / f"oppor_domain_{domain_id}_{label_type}_wd.data",
+-        PREPROCESSED_ROOT / f"oppor_domain_{domain_id}_wd.data",  # legacy author name
+-        PREPROCESSED_ROOT / f"{domain_id}_wd.data",
+-    ]
+-
+-
+-def load_domain_wd(domain_id: str, label_type: LabelType) -> Tuple[np.ndarray, np.ndarray]:
+-    file_path: Optional[Path] = None
+-    for cand in _preprocessed_candidates(domain_id, label_type):
+-        if cand.is_file():
+-            file_path = cand
+-            break
+-
+-    if file_path is None:
+-        raise FileNotFoundError(
+-            f"Could not find preprocessed .data for domain {domain_id} (label_type={label_type}) in {PREPROCESSED_ROOT}.\n"
+-            f"Expected e.g. oppor_domain_{domain_id}_{label_type}_wd.data"
++from utils import opp_sliding_window_w_d, get_sample_weights
++
++DATA_DIR = "./data/oppor_preprocessed"
++class data_loader_oppor(Dataset):
++    def __init__(self, samples, labels, domains):
++        self.samples = samples
++        self.labels = labels
++        self.domains = domains
++
++    def __getitem__(self, index):
++        sample, target, domain = self.samples[index], self.labels[index], self.domains[index]
++        return sample, target, domain
++
++    def __len__(self):
++        return len(self.samples)
++    
++    def load_domain_data(domain_idx):
++        """ to load all the data from the specific domain
++        :param domain_idx:
++        :return: X and y data of the entire domain
++        """
++        saved_filename = 'oppor_domain_' + domain_idx + '_wd.data' # with domain label
++        data = np.load(DATA_DIR + saved_filename, allow_pickle=True)
++        X = data[0][0]
++        y = data[0][1]
++        d = data[0][2]
++
++def prep_domains_oppor(SLIDING_WINDOW_LEN=30, SLIDING_WINDOW_STEP=15, batch_size = 64, target_domain = 'S1'):
++    """
++    Build dataloaders from already preprocessed domain files stored in a
++    dedicated directory.
++    """
++
++
++    source_domain_list = ['S1', 'S2', 'S3', 'S4']
++    source_domain_list.remove(target_domain)
++
++    source_loaders = []
++
++    # source domains
++    for source_domain in source_domain_list:
++        print('source_domain:', source_domain)
++
++        # load preprocessed domain file
++        domain_file = os.path.join(
++            DATA_DIR, f"oppor_domain_{source_domain}_wd.data"
++        )
++        data = np.load(domain_file, allow_pickle=True)
++        x, y, d = data[0]
++
++        # sliding window
++        x_win, y_win, d_win = opp_sliding_window_w_d(x, y, d, SLIDING_WINDOW_LEN, SLIDING_WINDOW_STEP)
++        y_win = np.asarray(y_win).reshape(-1)
++        d_win = np.asarray(d_win).reshape(-1)
++
++        if x_win.ndim == 2:
++            # expecting [N, T*F]
++            assert x_win.shape[1] == SLIDING_WINDOW_LEN * 77, (
++                f"Unexpected flattened shape: {x_win.shape}; "
++                f"expected second dim {SLIDING_WINDOW_LEN*77}"
++            )
++            x_win = x_win.reshape(-1, SLIDING_WINDOW_LEN, 77)
++        elif x_win.ndim == 3:
++            # expecting [N, T, F]
++            assert x_win.shape[1] == SLIDING_WINDOW_LEN and x_win.shape[2] == 77, (
++                f"Unexpected window shape: {x_win.shape}"
++            )
++        else:
++            raise ValueError(f"Unexpected x_win shape: {x_win.shape}")
++
++        # weighted sampling for class imbalance
++        unique_y, counts_y = np.unique(y_win, return_counts=True)
++        weights = 100.0 / torch.Tensor(counts_y)
++        weights = weights.double()
++        sample_weights = get_sample_weights(y_win, weights)
++
++        sampler = torch.utils.data.sampler.WeightedRandomSampler(
++            weights=sample_weights,
++            num_samples=len(sample_weights),
++            replacement=True
+         )
+ 
+-    with file_path.open("rb") as f:
+-        obj = pickle.load(f)
+-
+-    parts = obj if isinstance(obj, list) else [obj]
+-
+-    xs: List[np.ndarray] = []
+-    ys: List[np.ndarray] = []
+-    for part in parts:
+-        if not isinstance(part, tuple) or len(part) < 2:
+-            raise TypeError(f"Unexpected pickle part structure in {file_path}: {type(part)}")
+-
+-        X = np.asarray(part[0], dtype=np.float32)
+-        y = np.asarray(part[1])
+-
+-        if y.ndim == 2 and y.shape[1] == 1:
+-            y = y.reshape(-1)
+-        y = y.astype(np.int64)
+-
+-        if X.ndim != 2 or X.shape[1] != NUM_FEATURES:
+-            raise ValueError(f"Expected X shape (N,{NUM_FEATURES}), got {X.shape} from {file_path}")
+-
+-        xs.append(X)
+-        ys.append(y)
+-
+-    X_all = np.vstack(xs).astype(np.float32)
+-    y_all = np.concatenate(ys).astype(np.int64)
+-
+-    # Basic sanity checks: prevent silent task mismatches
+-    if np.isnan(X_all).any():
+-        raise ValueError(f"Found NaNs in X for {domain_id} ({label_type}). Preprocessing mismatch/corruption.")
+-
+-    # Validate label range against the requested task
+-    exp_classes = _expected_num_classes(label_type)
+-    y_min = int(y_all.min()) if y_all.size else 0
+-    y_max = int(y_all.max()) if y_all.size else 0
+-
+-    # Gestures typically include 0 as "null". Locomotion often includes 0 too, depending on mapping.
+-    if y_min < 0 or y_max >= exp_classes:
+-        raise ValueError(
+-            f"Label range mismatch for {domain_id}: y in [{y_min}, {y_max}] but label_type={label_type} "
+-            f"expects < {exp_classes} classes.\n"
+-            f"This usually means you loaded the wrong preprocessed file (gestures vs locomotion) or the mapping differs."
++        dataset = data_loader_oppor(x_win, y_win, d_win)
++        loader = DataLoader(
++            dataset,
++            batch_size=batch_size,
++            shuffle=False,
++            drop_last=True,
++            sampler=sampler
+         )
+ 
+-    return X_all, y_all
+-
+-
+-class OpportunityAuthorWindowDataset(Dataset):
+-    def __init__(
+-        self,
+-        domain_ids: Sequence[str],
+-        *,
+-        label_type: LabelType,
+-        window_size: int,
+-        step_size: int,
+-        flatten: bool,
+-        expected_x_dim: Optional[int] = None,  # e.g., 30*77
+-    ):
+-        xs, ys, ds = [], [], []
+-
+-        for dom in domain_ids:
+-            X, y = load_domain_wd(dom, label_type=label_type)
+-            d = np.full((len(y),), _domain_id_to_int(dom), dtype=np.int64)
+-
+-            x_win, y_win, d_win = opp_sliding_window_w_d(
+-                X, y, d,
+-                window_size=window_size,
+-                step_size=step_size,
+-            )
++        print('source_loader batch:', len(loader))
++        source_loaders.append(loader)
+ 
+-            # Enforce explicit expectations
+-            if np.isnan(x_win).any():
+-                raise ValueError(f"NaNs after windowing for domain {dom}. Check normalization / interpolation.")
+-
+-            if flatten:
+-                # expected shape: (Nwin, window_size*NUM_FEATURES)
+-                if x_win.ndim != 2 or x_win.shape[1] != window_size * NUM_FEATURES:
+-                    raise ValueError(
+-                        f"Windowed X has shape {x_win.shape}, expected (N,{window_size*NUM_FEATURES})."
+-                    )
+-                if expected_x_dim is not None and x_win.shape[1] != expected_x_dim:
+-                    raise ValueError(
+-                        f"x_dim mismatch: loader produced {x_win.shape[1]} but model expects {expected_x_dim}."
+-                    )
+-            else:
+-                # optional non-flattened support if you ever need it
+-                if x_win.ndim != 3 or x_win.shape[1:] != (window_size, NUM_FEATURES):
+-                    raise ValueError(
+-                        f"Windowed X has shape {x_win.shape}, expected (N,{window_size},{NUM_FEATURES})."
+-                    )
+-
+-            xs.append(x_win)
+-            ys.append(y_win.astype(np.int64).reshape(-1))
+-            ds.append(d_win.astype(np.int64).reshape(-1))
+-
+-        self.x = torch.from_numpy(np.vstack(xs)).float()
+-        self.y = torch.from_numpy(np.concatenate(ys)).long()
+-        self.d = torch.from_numpy(np.concatenate(ds)).long()
+-
+-    def __len__(self) -> int:
+-        return int(self.y.numel())
+-
+-    def __getitem__(self, idx: int):
+-        return self.x[idx], self.y[idx], self.d[idx]
+-
+-
+-def build_opportunity_loader(
+-    *,
+-    domain_ids: Sequence[str],
+-    label_type: LabelType = "gestures",
+-    batch_size: int = 64,
+-    balanced: bool = False,
+-    shuffle: bool = False,
+-    window_size: int = 30,
+-    step_size: int = 15,
+-    flatten: bool = True,
+-    expected_x_dim: Optional[int] = None,
+-    num_workers: int = 0,
+-    pin_memory: bool = True,
+-    drop_last: bool = True,
+-) -> DataLoader:
+-    dataset = OpportunityAuthorWindowDataset(
+-        domain_ids=domain_ids,
+-        label_type=label_type,
+-        window_size=window_size,
+-        step_size=step_size,
+-        flatten=flatten,
+-        expected_x_dim=expected_x_dim,
++    # target domain
++    print('target_domain:', target_domain)
++
++    domain_file = os.path.join(
++        DATA_DIR, f"oppor_domain_{target_domain}_wd.data"
+     )
++    data = np.load(domain_file, allow_pickle=True)
++    x, y, d = data[0]
+ 
+-    if balanced:
+-        y = dataset.y
+-        num_classes = int(y.max().item()) + 1 if y.numel() else 1
+-        counts = torch.bincount(y, minlength=num_classes).float().clamp_min(1.0)
+-        class_w = 1.0 / counts
+-        sample_w = class_w[y].double()
+-
+-        sampler = WeightedRandomSampler(
+-            weights=sample_w,
+-            num_samples=len(sample_w),
+-            replacement=True,
++    x_win, y_win, d_win = opp_sliding_window_w_d(
++        x, y, d, SLIDING_WINDOW_LEN, SLIDING_WINDOW_STEP
++    )
++    y_win = np.asarray(y_win).reshape(-1)
++    d_win = np.asarray(d_win).reshape(-1)
++
++    x_win = np.asarray(x_win)
++    if x_win.ndim == 2:
++        # expecting [N, T*F]
++        assert x_win.shape[1] == SLIDING_WINDOW_LEN * 77, (
++            f"Unexpected flattened shape: {x_win.shape}; "
++            f"expected second dim {SLIDING_WINDOW_LEN*77}"
+         )
+-        return DataLoader(
+-            dataset,
+-            batch_size=batch_size,
+-            sampler=sampler,
+-            shuffle=False,
+-            drop_last=drop_last,
+-            num_workers=num_workers,
+-            pin_memory=pin_memory,
++        x_win = x_win.reshape(-1, SLIDING_WINDOW_LEN, 77)
++    elif x_win.ndim == 3:
++        # expecting [N, T, F]
++        assert x_win.shape[1] == SLIDING_WINDOW_LEN and x_win.shape[2] == 77, (
++            f"Unexpected window shape: {x_win.shape}"
+         )
++    else:
++        raise ValueError(f"Unexpected x_win shape: {x_win.shape}")
+ 
+-    return DataLoader(
++    dataset = data_loader_oppor(x_win, y_win, d_win)
++    target_loader = DataLoader(
+         dataset,
+         batch_size=batch_size,
+-        shuffle=shuffle,
+-        drop_last=drop_last,
+-        num_workers=num_workers,
+-        pin_memory=pin_memory,
++        shuffle=False
+     )
++
++    return source_loaders, target_loader
+diff --git a/utils.py b/utils.py
+index a8f09e5..ac27d9a 100644
+--- a/utils.py
++++ b/utils.py
+@@ -1,6 +1,20 @@
+ import numpy as np
+ from sliding_window import sliding_window
+ import torch
++
++def get_sample_weights(y, weights):
++    '''
++    to assign weights to each sample
++    '''
++    label_unique = np.unique(y)
++    sample_weights = []
++    for val in y:
++        idx = np.where(label_unique == val)
++        sample_weights.append(weights[idx])
++    return sample_weights
++
++
++
+ def opp_sliding_window_w_d(
+     data_x: np.ndarray,
+     data_y: np.ndarray,
+-- 
+2.50.1 (Apple Git-155)
+

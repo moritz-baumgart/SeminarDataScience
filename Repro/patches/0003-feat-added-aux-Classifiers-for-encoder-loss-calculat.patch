@@ -1,0 +1,366 @@
+From 715dda6e5b5d338dbba9923045b230904853502c Mon Sep 17 00:00:00 2001
+From: sinan-pourazari <sinan.pourazari@gmx.de>
+Date: Sat, 10 Jan 2026 16:54:03 +0100
+Subject: [PATCH 03/16] feat: added aux Classifiers for encoder loss
+ calculation
+
+---
+ main.py             | 132 ++++++++++++++++++++++++++++++++------------
+ model_GLIE.py       |  62 ++++++++++-----------
+ oppor_dataloader.py |  46 ++++++---------
+ 3 files changed, 143 insertions(+), 97 deletions(-)
+
+diff --git a/main.py b/main.py
+index a57e4b8..4663444 100644
+--- a/main.py
++++ b/main.py
+@@ -4,10 +4,11 @@ from model_GLIE import kl_divergence, GILE
+ from utils import GradReverse
+ import torch
+ import torch.nn.functional as F
++from sklearn.metrics import f1_score
+ 
+ 
+ # hyperparameter
+-beta_kl = 0.2      # KL-Regularisierung
++beta_kl = 0.8     # KL-Regularisierung
+ alpha_cls = 1.0    # Klassifikations-Loss
+ gamma_ie = 0.5     # Independent Excitation
+ 
+@@ -54,53 +55,114 @@ def train_one_epoch(model, loader):
+ 
+         out = model(x, y, d)
+ 
+-        # reconstruction (ELBO)
+-        recon_loss = F.mse_loss(out["x_recon"], x)
+-        mu_a_p, sigma_a_p = model.activity_prior(y)
+-        mu_d_p, sigma_d_p = model.domain_prior(d)
+-        #print(mu_d_p.mean(), mu_a_p.mean())
+-        logvar_a_p = torch.log(sigma_a_p ** 2)
+-        logvar_d_p = torch.log(sigma_d_p ** 2)
++        loss = model.compute_loss(x,y,d,out,beta_kl)
+ 
+-        # KL(q || p)
+-        kl_a = kl_divergence(out["logvar_a"], logvar_a_p, out["mu_a"], mu_a_p)
++        optimizer.zero_grad()
++        loss.backward()
++        optimizer.step()
+ 
+-        kl_d = kl_divergence(out["logvar_d"], logvar_d_p, out["mu_d"], mu_d_p)
++        total_loss += loss.item()
+ 
++    return total_loss / len(loader)
+ 
+-        # negative ELBO (to minimize)
+-        elbo_loss = recon_loss + beta_kl * (kl_a + kl_d)
++@torch.no_grad()
++def evaluate(model, loader):
++    model.eval()
++
++    all_y_true = []
++    all_y_pred = []
++
++    all_d_true = []
++    all_d_pred = []
++
++    for x, y, d in loader:
++        x = x.to(device)
++        y = y.to(device)
++        d = d.to(device)
+ 
+-        # classification
+-        activity_loss = F.cross_entropy(out["activity_logits"], y)
+-        domain_loss   = F.cross_entropy(out["domain_logits"], d)
++        out = model(x, y, d)
+ 
+-        classification_loss = activity_loss + domain_loss
++        # Activity predictions
++        y_pred = torch.argmax(out["activity_logits"], dim=1)
+ 
+-        z_a_rev = GradReverse.apply(out["z_activity"], gamma_ie)
+-        z_d_rev = GradReverse.apply(out["z_domain"], gamma_ie)
+-        
+-        # independent excitation
+-        domain_from_activity = model.domain_classifier(z_a_rev)
+-        activity_from_domain = model.activity_classifier(z_d_rev)
++        all_y_true.append(y.cpu())
++        all_y_pred.append(y_pred.cpu())
+ 
+-        ie_loss = (
+-            F.cross_entropy(domain_from_activity, d)
+-            + F.cross_entropy(activity_from_domain, y)
+-        )
++        # (optional) Domain predictions
++        d_pred = torch.argmax(out["domain_logits"], dim=1)
++        all_d_true.append(d.cpu())
++        all_d_pred.append(d_pred.cpu())
+ 
+-        loss = elbo_loss + alpha_cls * classification_loss + ie_loss
++    y_true = torch.cat(all_y_true).numpy()
++    y_pred = torch.cat(all_y_pred).numpy()
+ 
+-        optimizer.zero_grad()
+-        loss.backward()
+-        optimizer.step()
++    d_true = torch.cat(all_d_true).numpy()
++    d_pred = torch.cat(all_d_pred).numpy()
+ 
+-        total_loss += loss.item()
++    activity_f1_macro = f1_score(y_true, y_pred, average="macro")
++    activity_f1_weighted = f1_score(y_true, y_pred, average="weighted")
+ 
+-    return total_loss / len(loader)
++    domain_f1_macro = f1_score(d_true, d_pred, average="macro")
++
++    return {
++        "activity_f1_macro": activity_f1_macro,
++        "activity_f1_weighted": activity_f1_weighted,
++        "domain_f1_macro": domain_f1_macro,
++    }
++@torch.no_grad()
++def eval(model, loader):
++    model.eval()
++
++    all_y_true = []
++    all_y_pred = []
++
++    all_d_true = []
++    all_d_pred = []
++
++    for x, y, d in loader:
++        x = x.to(device)
++        y = y.to(device)
++        d = d.to(device)
++
++        out = model(x, y, d)
++
++        # Activity predictions
++        y_pred = torch.argmax(out["activity_logits"], dim=1)
++
++        all_y_true.append(y.cpu())
++        all_y_pred.append(y_pred.cpu())
++
++        # (optional) Domain predictions
++        d_pred = torch.argmax(out["domain_logits"], dim=1)
++        all_d_true.append(d.cpu())
++        all_d_pred.append(d_pred.cpu())
++
++    y_true = torch.cat(all_y_true).numpy()
++    y_pred = torch.cat(all_y_pred).numpy()
++
++    d_true = torch.cat(all_d_true).numpy()
++    d_pred = torch.cat(all_d_pred).numpy()
++
++    activity_f1_macro = f1_score(y_true, y_pred, average="macro")
++    activity_f1_weighted = f1_score(y_true, y_pred, average="weighted")
++
++    domain_f1_macro = f1_score(d_true, d_pred, average="macro")
++
++    return {
++        "activity_f1_macro": activity_f1_macro,
++        "activity_f1_weighted": activity_f1_weighted,
++        "domain_f1_macro": domain_f1_macro,
++    }
+ 
+ 
+ # training
+-for epoch in range(100):
++for epoch in range(500):
+     loss = train_one_epoch(model, train_loader)
+-    print(f"Epoch {epoch:02d} | Train Loss: {loss:.4f}")
++    metrics = evaluate(model, test_loader)
++    print(
++        f"Epoch {epoch:02d} | "
++        f"Train Loss: {loss:.4f} | "
++        f"Act F1 (macro): {metrics['activity_f1_macro']:.3f} | "
++        f"Act F1 (weighted): {metrics['activity_f1_weighted']:.3f} | "
++        f"Domain F1 (weighted): {metrics['domain_f1_macro']:.3f}"
++    )
+\ No newline at end of file
+diff --git a/model_GLIE.py b/model_GLIE.py
+index eaadbbe..ea1877d 100644
+--- a/model_GLIE.py
++++ b/model_GLIE.py
+@@ -2,12 +2,7 @@ from __future__ import annotations
+ import torch
+ import torch.nn as nn
+ import torch.nn.functional as F
+-
+-
+-
+-import torch
+-import torch.nn as nn
+-import torch.nn.functional as F
++import torch.distributions as dist
+ from typing import Tuple
+ 
+ 
+@@ -319,39 +314,40 @@ class GILE(nn.Module):
+             "d": d,
+         }
+     
+-    def compute_loss(self, outputs, x, y, d):
+-        # Reconstruction
+-        recon_loss = F.mse_loss(outputs["x_recon"], x)
++  
++    def compute_loss(self, x, y, d, pred, beta_kl, aux_y=1.0, aux_d=1.0):
++        recon_loss = F.mse_loss(pred["x_recon"], x, reduction="mean")
+ 
+-        # ----- PRIORS GO HERE -----
+-        mu_a_p, sigma_a_p = self.activity_prior(y)
+-        mu_d_p, sigma_d_p = self.domain_prior(d)
++        #  priors p(z|y), p(z_d|d) 
++        mu_a_p, sigma_a_p = self.activity_prior(y)   # (B, latent)
++        mu_d_p, sigma_d_p = self.domain_prior(d)     # (B, latent
+ 
+-        logvar_a_p = torch.log(sigma_a_p ** 2)
+-        logvar_d_p = torch.log(sigma_d_p ** 2)
++        #  posteriors q(z|x), q(z_d|x) 
++        std_a_q = torch.exp(0.5 * pred["logvar_a"])
++        std_d_q = torch.exp(0.5 * pred["logvar_d"])
++        
++        # encoder predicted latent Dist
++        q_a = dist.Independent(dist.Normal(pred["mu_a"], std_a_q), 1)
++        q_d = dist.Independent(dist.Normal(pred["mu_d"], std_d_q), 1)
+ 
+-        kl_activity = kl_divergence(
+-            outputs["logvar_a"], logvar_a_p,
+-            outputs["mu_a"], mu_a_p,
+-        )
++        # model expected latnet Dist
++        p_a = dist.Independent(dist.Normal(mu_a_p, sigma_a_p), 1)
++        p_d = dist.Independent(dist.Normal(mu_d_p, sigma_d_p), 1)
+ 
+-        kl_domain = kl_divergence(
+-            outputs["logvar_d"], logvar_d_p,
+-            outputs["mu_d"], mu_d_p,
+-        )
++       # E_q[log p - log q] = -KL(q||p)
++        kl_a_neg = (p_a.log_prob(pred["z_activity"]) - q_a.log_prob(pred["z_activity"]))  # (B,)
++        kl_d_neg = (p_d.log_prob(pred["z_domain"])   - q_d.log_prob(pred["z_domain"]))    # (B,)
+ 
+-        # Auxiliary classification
+-        cls_activity = F.cross_entropy(outputs["activity_logits"], y)
+-        cls_domain = F.cross_entropy(outputs["domain_logits"], d)
++        kl_a_neg = kl_a_neg.mean()
++        kl_d_neg = kl_d_neg.mean()
+ 
+-        total_loss = (
+-            recon_loss
+-            + self.beta_activity * kl_activity
+-            + self.beta_domain * kl_domain
+-            + cls_activity
+-            + cls_domain
+-        )
++        # ---------- Auxiliary classifiers ----------
++        ce_y = F.cross_entropy(pred["activity_logits"], y, reduction="mean")
++        ce_d = F.cross_entropy(pred["domain_logits"],   d, reduction="mean")
+ 
++        # negative ELBO (to minimize): recon_loss - (logp-logq) = recon_loss + KL
++        elbo_loss = recon_loss - beta_kl * (kl_a_neg + kl_d_neg)
++        total_loss = elbo_loss + aux_y * ce_y + aux_d * ce_d
+         return total_loss
+ 
+ def kl_divergence(logvar_q, logvar_p, mu_q, mu_p):
+@@ -359,4 +355,4 @@ def kl_divergence(logvar_q, logvar_p, mu_q, mu_p):
+     var_q = torch.exp(logvar_q)
+     var_p = torch.exp(logvar_p)
+     kl = 0.5 * (logvar_p - logvar_q + (var_q + (mu_q - mu_p)**2) / var_p - 1.0)
+-    return kl.sum(dim=1).mean()
+\ No newline at end of file
++    return kl.sum(dim=1).mean()
+diff --git a/oppor_dataloader.py b/oppor_dataloader.py
+index 34fe38c..5e60e34 100644
+--- a/oppor_dataloader.py
++++ b/oppor_dataloader.py
+@@ -5,17 +5,13 @@ import torch
+ from torch.utils.data import Dataset, DataLoader
+ from pandas import Series
+ from utils import opp_sliding_window_w_d
+-# --------------------------------------------------
+ # Configuration
+-# --------------------------------------------------
+ 
+ NUM_FEATURES = 77
+ DATA_ROOT = "./data/OpportunityUCIDataset/dataset/"
+ WINDOW_SIZE = 24
+-STEP_SIZE = 12
+-# --------------------------------------------------
++STEP_SIZE = 24
+ # Dataset
+-# --------------------------------------------------
+ 
+ class OpportunityDataset(Dataset):
+     """
+@@ -55,9 +51,7 @@ class OpportunityDataset(Dataset):
+             np.concatenate(ds),
+         )
+ 
+-# --------------------------------------------------
+ # Domain loading
+-# --------------------------------------------------
+ 
+ def load_domain(domain_id, label_type):
+     files = [
+@@ -85,9 +79,7 @@ def load_domain(domain_id, label_type):
+     d = d.reshape(-1)
+     return x, y, d
+ 
+-# --------------------------------------------------
+ # Preprocessing pipeline
+-# --------------------------------------------------
+ 
+ def process_dataset_file(data, label):
+     data = select_columns_opp(data)
+@@ -152,9 +144,7 @@ def normalize(x):
+     x = (x - mean) / std
+     return x
+ 
+-# --------------------------------------------------
+ # Convenience loader builders
+-# --------------------------------------------------
+ 
+ def build_opportunity_loader(
+     domain_ids,
+@@ -165,22 +155,20 @@ def build_opportunity_loader(
+     dataset = OpportunityDataset(domain_ids, label_type)
+     return DataLoader(dataset, batch_size=batch_size, shuffle=shuffle)
+ 
+-# --------------------------------------------------
+ # Example usage (LOSO)
+-# --------------------------------------------------
+-
+-if __name__ == "__main__":
+-    train_loader = build_opportunity_loader(
+-        domain_ids=["S1", "S2", "S3"],
+-        batch_size=64,
+-        shuffle=True,
+-    )
+-
+-    test_loader = build_opportunity_loader(
+-        domain_ids=["S4"],
+-        batch_size=64,
+-        shuffle=False,
+-    )
+-
+-    x, y, d = next(iter(train_loader))
+-    print(x.shape, y.shape, d.shape)
++
++#if __name__ == "__main__":
++#    train_loader = build_opportunity_loader(
++#        domain_ids=["S1", "S2", "S3"],
++#        batch_size=64,
++#        shuffle=True,
++#    )#
++
++#    test_loader = build_opportunity_loader(
++#        domain_ids=["S4"],
++#        batch_size=64,
++#        shuffle=False,
++#    )
++
++#    x, y, d = next(iter(train_loader))
++#    print(x.shape, y.shape, d.shape)
+-- 
+2.50.1 (Apple Git-155)
+

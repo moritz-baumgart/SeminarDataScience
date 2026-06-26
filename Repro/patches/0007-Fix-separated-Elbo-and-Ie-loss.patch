@@ -1,0 +1,255 @@
+From 4c3e50ed2f9f20696f7135c83165f992d1702499 Mon Sep 17 00:00:00 2001
+From: sinan-pourazari <sinan.pourazari@gmx.de>
+Date: Tue, 13 Jan 2026 01:48:20 +0100
+Subject: [PATCH 07/16] Fix: separated Elbo and Ie loss
+
+---
+ main.py             | 63 ++++++++++++++++++++++++--------
+ model_GLIE.py       | 88 ++++++++++++++++++++++++++++-----------------
+ oppor_dataloader.py |  7 ++--
+ 3 files changed, 109 insertions(+), 49 deletions(-)
+
+diff --git a/main.py b/main.py
+index dcb3318..b839922 100644
+--- a/main.py
++++ b/main.py
+@@ -16,10 +16,6 @@ aux_d    = 1.0
+ 
+ # device
+ device = "cuda" if torch.cuda.is_available() else "cpu"
+-print(torch.cuda.is_available())
+-print(torch.__version__)
+-print(torch.version.cuda)
+-print(torch.backends.cuda.is_built())
+ 
+ # dataloader (LOSO)
+ train_loader = build_opportunity_loader(
+@@ -45,28 +41,63 @@ model = GILE(
+     latent_dim=16,
+ ).to(device)
+ print(device)
+-optimizer = torch.optim.Adam(model.parameters(), lr=1e-3, weight_decay= 1e-3)
+ 
+ 
+-def train_one_epoch(model, loader):
++ie_params = (
++    list(model.activity_classifier_ie.parameters()) +
++    list(model.domain_classifier_ie.parameters())
++)
++
++main_params = []
++for name, p in model.named_parameters():
++    if name.startswith("activity_classifier_ie") or name.startswith("domain_classifier_ie"):
++        continue
++    main_params.append(p)
++
++opt_main = torch.optim.Adam(main_params, lr=1e-3, weight_decay=1e-3)
++opt_ie   = torch.optim.Adam(ie_params,   lr=1e-3, weight_decay=1e-3)
++
++def train_one_epoch(model, loader, opt_main, opt_ie):
+     model.train()
+-    total_loss = 0.0
++    total_main = 0.0
++    total_ie = 0.0
++
+     for x, y, d in loader:
+         x = x.to(device)
+         y = y.to(device)
+         d = d.to(device)
+ 
++        # (1) IE / false step
++        # train ONLY IE heads, encoders must NOT move (detach is inside compute_loss_ie)
+         out = model(x, y, d)
+ 
+-        loss = model.compute_loss(x, y, d, out, beta_kl, aux_y, aux_d, gamma_ie)
++        loss_ie = model.compute_loss_ie(y, d, out)
++
++        opt_ie.zero_grad(set_to_none=True)
++        loss_ie.backward()
++        opt_ie.step()
++
++        total_ie += loss_ie.item()
+ 
+-        optimizer.zero_grad()
+-        loss.backward()
+-        optimizer.step()
++        # (2) main step
++        # train encoder/decoder/priors + true heads, and confuse IE heads via -gamma * ie_loss
++        out = model(x, y, d)  # recompute forward (safer after step 1)
++
++        loss_main = model.compute_loss_main(x, y, d, out, beta_kl, aux_y, aux_d, gamma_ie)
++
++        opt_main.zero_grad(set_to_none=True)
++        loss_main.backward()
++        opt_main.step()
++
++        total_main += loss_main.item()
++
++    return {
++        "loss_main": total_main / len(loader),
++        "loss_ie": total_ie / len(loader),
++        "loss_total": (total_main + total_ie) / len(loader),
++    }
+ 
+-        total_loss += loss.item()
+ 
+-    return total_loss / len(loader)
+ 
+ @torch.no_grad()
+ def evaluate(model, loader):
+@@ -160,11 +191,13 @@ def eval(model, loader):
+ 
+ # training
+ for epoch in range(500):
+-    loss = train_one_epoch(model, train_loader)
++    loss = train_one_epoch(model, train_loader, opt_main, opt_ie)
+     metrics = evaluate(model, test_loader)
+     print(
+             f"Epoch {epoch:02d} | "
+-            f"Train Loss: {loss:.4f} | "
++            f"Train Loss main: {loss["loss_main"]:.4f} | "
++            f"Train Loss ie: {loss["loss_ie"]:.4f} | "
++            f"Train Loss total: {loss["loss_total"]:.4f} | "
+             f"Act F1 (macro): {metrics['activity_f1_macro']:.3f} | "
+             f"Act F1 (weighted): {metrics['activity_f1_weighted']:.3f} | "
+             f"Domain F1 (weighted): {metrics['domain_f1_macro']:.3f}"
+diff --git a/model_GLIE.py b/model_GLIE.py
+index 9331fc5..8bbe179 100644
+--- a/model_GLIE.py
++++ b/model_GLIE.py
+@@ -506,58 +506,82 @@ class GILE(nn.Module):
+         }
+     
+   
+-    def compute_loss(self, x, y, d, pred, beta_kl, aux_y=1.0, aux_d=1.0, gamma_ie = 0.2):
++    def compute_loss_main(
++    self,
++    x,
++    y,
++    d,
++    pred,
++    beta_kl,
++    aux_y: float = 1.0,
++    aux_d: float = 1.0,
++    gamma_ie: float = 0.2,
++):
+         B = x.size(0)
+-        x_recon = pred["x_recon"].reshape(B, -1)
+-        x_target = x.view(B, -1)
+-
++        x_recon  = pred["x_recon"].reshape(B, -1)
++        x_target = x.reshape(B, -1)
+         recon_loss = F.mse_loss(x_recon, x_target, reduction="sum") / B
+ 
+-        #  priors p(z|y), p(z_d|d) 
+-        mu_a_p, sigma_a_p = self.activity_prior(y)   # (B, latent)
+-        mu_d_p, sigma_d_p = self.domain_prior(d)     # (B, latent
++        mu_a_p, sigma_a_p = self.activity_prior(y)
++        mu_d_p, sigma_d_p = self.domain_prior(d)
+ 
+-        #  posteriors q(z|x), q(z_d|x) 
+         std_a_q = torch.exp(0.5 * pred["logvar_a"])
+         std_d_q = torch.exp(0.5 * pred["logvar_d"])
+-        
+-        # encoder predicted latent Dist
++
+         q_a = dist.Independent(dist.Normal(pred["mu_a"], std_a_q), 1)
+         q_d = dist.Independent(dist.Normal(pred["mu_d"], std_d_q), 1)
+ 
+-        # model expected latnet Dist
+         p_a = dist.Independent(dist.Normal(mu_a_p, sigma_a_p), 1)
+         p_d = dist.Independent(dist.Normal(mu_d_p, sigma_d_p), 1)
+ 
+-       # E_q[log p - log q] = -KL(q||p)
+-        kl_a_neg = (p_a.log_prob(pred["z_activity"]) - q_a.log_prob(pred["z_activity"]))  # (B,)
+-        kl_d_neg = (p_d.log_prob(pred["z_domain"])   - q_d.log_prob(pred["z_domain"]))    # (B,)
++        kl_a_neg = (p_a.log_prob(pred["z_activity"]) - q_a.log_prob(pred["z_activity"])).mean()
++        kl_d_neg = (p_d.log_prob(pred["z_domain"])   - q_d.log_prob(pred["z_domain"])).mean()
+ 
+-        kl_a_neg = kl_a_neg.mean()
+-        kl_d_neg = kl_d_neg.mean()
++        ce_y = F.cross_entropy(pred["activity_logits"], y, reduction="sum") / B
++        ce_d = F.cross_entropy(pred["domain_logits"],   d, reduction="sum") / B
++        dc_loss = aux_y * ce_y + aux_d * ce_d
++
++        elbo_loss = recon_loss - beta_kl * (kl_a_neg + kl_d_neg)
+ 
+-        #  Auxiliary classifiers 
+-        ce_y = F.cross_entropy(pred["activity_logits"], y, reduction="sum")/ B
+-        ce_d = F.cross_entropy(pred["domain_logits"],   d, reduction="sum")/ B
++        # IE (adversarial) -> GRL rein, vorzeichen bleibt "+"
++        z_d_grl = GradReverse.apply(pred["z_domain"],   1.0)  # z_domain -> predict y
++        z_y_grl = GradReverse.apply(pred["z_activity"], 1.0)  # z_activity -> predict d
+ 
+-        # Independant Excitation
+-        z_domain_grl   = GradReverse.apply(pred["z_domain"],   1.0)  # z_d -> DCy
+-        z_activity_grl = GradReverse.apply(pred["z_activity"], 1.0)  # z   -> DCd
++        logits_y_from_zd = self.activity_classifier_ie(z_d_grl)
++        logits_d_from_zy = self.domain_classifier_ie(z_y_grl)
+ 
+-        logits_y_from_zd = self.activity_classifier_ie(z_domain_grl)   # DCy(z_d)
+-        logits_d_from_z  = self.domain_classifier_ie(z_activity_grl)   # DCd(z)
++        ie_y = F.cross_entropy(logits_y_from_zd, y, reduction="sum") / B
++        ie_d = F.cross_entropy(logits_d_from_zy, d, reduction="sum") / B
++        ie_loss = ie_y + ie_d
+ 
+-        ie_y = F.cross_entropy(logits_y_from_zd, y, reduction="sum")/ B
+-        ie_d = F.cross_entropy(logits_d_from_z,  d, reduction="sum")/ B
++        # main objective: minimize elbo + dc, and (via GRL) remove leakage
++        total_main = elbo_loss + dc_loss #+ gamma_ie * ie_loss
++        return total_main
+ 
+ 
+-        # negative ELBO (to minimize): recon_loss - (logp-logq) = recon_loss + KL
+-        elbo_loss = recon_loss - beta_kl * (kl_a_neg + kl_d_neg)
+-        dc_loss =  aux_y * ce_y + aux_d * ce_d
+ 
+-        ie_loss = ie_y + ie_d
+-        total_loss = elbo_loss + dc_loss + gamma_ie * ie_loss
+-        return total_loss
++    def compute_loss_ie(
++        self,
++        y,
++        d,
++        pred,
++    ):
++        """
++        IE / false step (optimizer_ie):
++        train ONLY the IE heads to be good at predicting the wrong thing.
++        -> detach latents so encoders dont move in this step
++        """
++        z_d = pred["z_domain"].detach()
++        z_y = pred["z_activity"].detach()
++
++        logits_y_from_zd = self.activity_classifier_ie(z_d)
++        logits_d_from_zy = self.domain_classifier_ie(z_y)
++
++        ie_y = F.cross_entropy(logits_y_from_zd, y, reduction="mean")
++        ie_d = F.cross_entropy(logits_d_from_zy, d, reduction="mean")
++
++        return ie_y + ie_d
++
+ 
+ def kl_divergence(logvar_q, logvar_p, mu_q, mu_p):
+     # returns mean KL over batch
+diff --git a/oppor_dataloader.py b/oppor_dataloader.py
+index 0f6f298..2681ff2 100644
+--- a/oppor_dataloader.py
++++ b/oppor_dataloader.py
+@@ -20,8 +20,11 @@ DATA_ROOT = Path("./data/OpportunityUCIDataset/dataset/")
+ CACHE_DIR = Path("./data/oppor/cache/")
+ CACHE_DIR.mkdir(parents=True, exist_ok=True)
+ 
+-WINDOW_SIZE = int(os.getenv("OPP_WINDOW_SIZE", "24"))
+-STEP_SIZE   = int(os.getenv("OPP_STEP_SIZE", "24")) 
++WINDOW_SIZE = 30
++STEP_SIZE   = 15
++
++#WINDOW_SIZE = int(os.getenv("OPP_WINDOW_SIZE", "24"))
++#STEP_SIZE   = int(os.getenv("OPP_STEP_SIZE", "12")) 
+ 
+ 
+ # Dataset
+-- 
+2.50.1 (Apple Git-155)
+
